@@ -95,13 +95,24 @@ def print_result_box(before: str, after: str) -> None:
 
 def load_training_data(json_path: Path) -> List[Dict[str, Any]]:
     """Load training data from JSON file."""
-    if not json_path.exists():
-        raise FileNotFoundError(f"Training data not found: {json_path}")
+    # Try multiple possible paths
+    possible_paths = [
+        json_path,
+        PROJECT_ROOT / json_path.name,
+        PROJECT_ROOT / "output" / json_path.name,
+        OUTPUT_DIR / json_path.name,
+    ]
     
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    for path in possible_paths:
+        if path.exists():
+            logger.info(f"Loading training data from: {path}")
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("samples", [])
     
-    return data.get("samples", [])
+    raise FileNotFoundError(
+        f"Training data not found. Tried: {possible_paths}"
+    )
 
 
 def find_high_risk_sample(
@@ -248,13 +259,29 @@ def run_demo() -> None:
     # =========================================================================
     print_stage(3, "Agent B (The Judge) - Visual Chain-of-Thought Correction")
     
-    # Load the crop image
+    # Load the crop image (handle various path formats)
     image_path_rel = target_sample.get("image_path", "")
-    image_path = OUTPUT_DIR.parent / image_path_rel
     
-    if not image_path.exists():
-        # Try alternative path
-        image_path = OUTPUT_DIR / Path(image_path_rel).name
+    # Try multiple possible paths
+    possible_image_paths = [
+        OUTPUT_DIR.parent / image_path_rel,  # Relative from project root
+        OUTPUT_DIR / Path(image_path_rel).name,  # Just filename in output dir
+        PROJECT_ROOT / image_path_rel,  # Direct relative path
+        Path(image_path_rel),  # Absolute path
+    ]
+    
+    image_path = None
+    for path in possible_image_paths:
+        if path.exists():
+            image_path = path
+            break
+    
+    if image_path is None:
+        # Last resort: try to find in output/crops
+        filename = Path(image_path_rel).name
+        crops_dir = OUTPUT_DIR / "crops"
+        if crops_dir.exists():
+            image_path = crops_dir / filename
     
     print()
     print(f"  Loading crop image: {image_path}")

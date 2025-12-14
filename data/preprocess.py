@@ -105,13 +105,12 @@ class DataProcessor:
                 lang=lang,
                 det_model_dir=det_model_dir,
                 rec_model_dir=rec_model_dir,
-                show_log=False,
             )
             logger.info("Agent A initialized successfully.")
         except Exception as e:
             logger.warning(f"Failed to init AgentA with custom params: {e}")
             logger.warning("Trying with default parameters...")
-            self.agent_a = AgentA(use_gpu=False, show_log=False)
+            self.agent_a = AgentA(use_gpu=False)
 
         # L2W1-MOD-004: Initialize Router for PPL calculation
         logger.info("Initializing Router (The Gatekeeper)...")
