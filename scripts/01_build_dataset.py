@@ -107,26 +107,28 @@ logger = logging.getLogger(__name__)
 
 def load_chinese_font(font_size: int = 40) -> Optional[ImageFont.FreeTypeFont]:
     """Load a Chinese font for text rendering.
-    
+
     Tries multiple common font paths on different platforms:
     - Windows: simhei.ttf, msyh.ttf
     - Linux/Mac: NotoSansCJK, WenQuanYi, etc.
-    
+
     Args:
         font_size: Font size in pixels.
-    
+
     Returns:
         ImageFont object, or None if no font found.
     """
     system = platform.system()
     font_paths = []
-    
+
     if system == "Windows":
         # Windows common Chinese fonts
-        windows_font_dir = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
+        windows_font_dir = os.path.join(
+            os.environ.get("WINDIR", "C:\\Windows"), "Fonts"
+        )
         font_paths = [
             os.path.join(windows_font_dir, "simhei.ttf"),  # 黑体
-            os.path.join(windows_font_dir, "msyh.ttf"),    # 微软雅黑
+            os.path.join(windows_font_dir, "msyh.ttf"),  # 微软雅黑
             os.path.join(windows_font_dir, "simsun.ttc"),  # 宋体
             os.path.join(windows_font_dir, "msyhbd.ttf"),  # 微软雅黑 Bold
         ]
@@ -148,12 +150,12 @@ def load_chinese_font(font_size: int = 40) -> Optional[ImageFont.FreeTypeFont]:
             "/Library/Fonts/Microsoft/msyh.ttf",
             "~/Library/Fonts/NotoSansCJK-Regular.ttc",
         ]
-    
+
     # Try to load each font
     for font_path in font_paths:
         # Expand user path (~)
         font_path = os.path.expanduser(font_path)
-        
+
         if os.path.exists(font_path):
             try:
                 font = ImageFont.truetype(font_path, font_size)
@@ -162,7 +164,7 @@ def load_chinese_font(font_size: int = 40) -> Optional[ImageFont.FreeTypeFont]:
             except Exception as e:
                 logger.debug(f"Failed to load font {font_path}: {e}")
                 continue
-    
+
     # Fallback: try to use default font (may not support Chinese)
     try:
         font = ImageFont.load_default()
@@ -423,11 +425,32 @@ def run_pipeline(
                 image_path=image_path,
                 ground_truth_text=gt_text,
             )
-            all_results.extend(results)
-            logger.info(f"         ✓ Generated {len(results)} character crops")
+
+            if not results:
+                logger.warning(
+                    f"         ⚠ No valid crops generated. This may be due to:"
+                )
+                logger.warning(f"           - OCR failed to recognize text")
+                logger.warning(
+                    f"           - All characters were filtered (IGNORE type)"
+                )
+                logger.warning(f"           - DTW alignment produced no valid pairs")
+                failed_items.append(
+                    {
+                        "path": str(image_path),
+                        "gt_text": gt_text,
+                        "error": "No valid crops generated (empty results)",
+                    }
+                )
+            else:
+                all_results.extend(results)
+                logger.info(f"         ✓ Generated {len(results)} character crops")
 
         except Exception as e:
+            import traceback
+
             logger.error(f"         ✗ Failed: {e}")
+            logger.debug(f"Full traceback:\n{traceback.format_exc()}")
             failed_items.append(
                 {
                     "path": str(image_path),
@@ -562,7 +585,18 @@ def main() -> None:
         logger.info("")
 
         demo_mode = True
+        logger.info("Generating demo test image...")
         demo_image = generate_demo_image(DEMO_IMAGE_PATH, DEMO_GT_TEXT)
+
+        # Verify image was created
+        if not demo_image.exists():
+            logger.error(f"Failed to generate demo image at {demo_image}")
+            logger.error("Cannot proceed without demo image.")
+            return
+        else:
+            logger.info(f"✓ Demo image created: {demo_image}")
+            logger.info(f"  Image size: {demo_image.stat().st_size} bytes")
+
         image_gt_pairs = [(demo_image, DEMO_GT_TEXT)]
 
         logger.info(f"Demo image: {demo_image}")
@@ -590,13 +624,46 @@ def main() -> None:
             crops_dir=CROPS_DIR,
             use_gpu=use_gpu,  # Default: True (use GPU), set USE_CPU=true to disable
         )
+
+        # Diagnostic information
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Pipeline Execution Summary")
+        logger.info("=" * 60)
+        logger.info(f"Total images processed: {len(image_gt_pairs)}")
+        logger.info(f"Successful crops: {len(results)}")
+        logger.info(f"Failed items: {len(failed)}")
+
+        if len(results) == 0:
+            logger.warning("")
+            logger.warning("⚠️  NO VALID CROPS GENERATED!")
+            logger.warning("")
+            logger.warning("Possible causes:")
+            logger.warning("  1. OCR failed to recognize any text")
+            logger.warning("  2. All characters were filtered (IGNORE type)")
+            logger.warning("  3. DTW alignment produced no valid pairs")
+            logger.warning("  4. All boxes were invalid after expansion")
+            logger.warning("")
+            logger.warning("Check the logs above for detailed error messages.")
+            logger.warning("")
+
+            if failed:
+                logger.warning("Failed items details:")
+                for item in failed:
+                    logger.warning(
+                        f"  - {item.get('path', 'N/A')}: {item.get('error', 'Unknown error')}"
+                    )
+
     except ImportError as e:
         logger.error(f"Import error: {e}")
         logger.error("Please ensure all dependencies are installed:")
         logger.error("  pip install -r requirements.txt")
         sys.exit(1)
     except Exception as e:
+        import traceback
+
         logger.error(f"Pipeline failed: {e}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         raise
 
     # Save results

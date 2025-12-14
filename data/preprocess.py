@@ -172,11 +172,20 @@ class DataProcessor:
         # === Step 2: OCR Inference via Agent A (with entropy) ===
         ocr_results, entropy_map, full_text = self._run_ocr_with_entropy(image_path)
 
+        logger.debug(f"OCR results count: {len(ocr_results)}")
+        logger.debug(f"Full text from OCR: '{full_text}'")
+        
         if not ocr_results:
-            raise ValueError(
+            error_msg = (
                 f"OCR returned no results for image: {image_path}. "
-                "Cannot proceed with alignment."
+                "Cannot proceed with alignment. "
+                "Possible causes: "
+                "1. Image is too small or low quality "
+                "2. No text detected in image "
+                "3. OCR model initialization failed"
             )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         # === Step 2.5: Compute PPL via Router (L2W1-MOD-004) ===
         # PPL is computed at line level, then assigned to all character crops
@@ -196,14 +205,24 @@ class DataProcessor:
 
         # === Step 3: DTW Alignment ===
         # DTWAligner expects: [{'char': 'X', 'box': [...], 'conf': 0.99}, ...]
+        logger.debug(f"Running DTW alignment: OCR={len(ocr_results)} chars, GT={len(ground_truth_text)} chars")
         aligned_pairs = self.aligner.align(ocr_results, ground_truth_text)
+        logger.debug(f"DTW alignment produced {len(aligned_pairs)} pairs")
 
         # === Step 4 & 5: Crop, Pad, Save ===
         metadata_list: List[Dict[str, Any]] = []
+        
+        # Count alignment types for debugging
+        align_type_counts = {}
+        for pair in aligned_pairs:
+            align_type = pair.align_type.value
+            align_type_counts[align_type] = align_type_counts.get(align_type, 0) + 1
+        logger.debug(f"Alignment type distribution: {align_type_counts}")
 
         for idx, pair in enumerate(aligned_pairs):
             # Skip IGNORE samples
             if pair.align_type == AlignmentType.IGNORE:
+                logger.debug(f"Skipping IGNORE sample at index {idx}: GT='{pair.gt_char}', Pred='{pair.pred_char}'")
                 continue
 
             # Get context (previous and next characters)
@@ -227,6 +246,7 @@ class DataProcessor:
 
             # Skip invalid boxes (after expansion)
             if expanded_box is None:
+                logger.debug(f"Skipping invalid box at index {idx} (expansion failed)")
                 continue
 
             x1, y1, x2, y2 = expanded_box
@@ -234,6 +254,7 @@ class DataProcessor:
 
             # Skip empty crops
             if crop.size == 0:
+                logger.debug(f"Skipping empty crop at index {idx}")
                 continue
 
             # Normalize to square canvas
@@ -277,6 +298,15 @@ class DataProcessor:
             }
 
             metadata_list.append(metadata)
+            logger.debug(f"Added crop {idx}: GT='{pair.gt_char}', Pred='{pair.pred_char}', Type={sample_type}")
+
+        logger.info(f"Generated {len(metadata_list)} valid crops from {len(aligned_pairs)} aligned pairs")
+        
+        if len(metadata_list) == 0 and len(aligned_pairs) > 0:
+            logger.warning(
+                f"All {len(aligned_pairs)} aligned pairs were filtered out. "
+                f"Check: IGNORE samples, invalid boxes, or empty crops."
+            )
 
         return metadata_list
 
@@ -300,19 +330,36 @@ class DataProcessor:
             - Entropy map for quick lookup: {char: {index: entropy}}
             - Full text line (concatenated from all characters) for PPL calculation
         """
+        logger.debug(f"Running OCR on: {image_path}")
+        
         # Get line-level results first (for PPL calculation)
-        line_results = self.agent_a.inference(str(image_path))
+        try:
+            line_results = self.agent_a.inference(str(image_path))
+            logger.debug(f"Line-level OCR results: {len(line_results)} lines")
+        except Exception as e:
+            logger.error(f"Agent A inference failed: {e}")
+            return [], {}, ""
         
         # Extract full text from line results
         full_text = ""
         if line_results:
             # Concatenate all detected text lines
-            full_text = " ".join([line["text"] for line in line_results if line.get("text")])
+            texts = [line.get("text", "") for line in line_results if line.get("text")]
+            full_text = "".join(texts)  # Remove space between lines for Chinese
+            logger.debug(f"Extracted full text: '{full_text}' (length: {len(full_text)})")
+        else:
+            logger.warning("No line-level OCR results returned")
         
         # Use Agent A's inference_with_char_boxes for character-level results
-        char_results = self.agent_a.inference_with_char_boxes(str(image_path))
+        try:
+            char_results = self.agent_a.inference_with_char_boxes(str(image_path))
+            logger.debug(f"Character-level OCR results: {len(char_results)} characters")
+        except Exception as e:
+            logger.error(f"Agent A inference_with_char_boxes failed: {e}")
+            return [], {}, full_text
 
         if not char_results:
+            logger.warning(f"No character-level OCR results for {image_path}")
             return [], {}, full_text
 
         # Convert to DTWAligner-compatible format and build entropy map
@@ -325,7 +372,7 @@ class DataProcessor:
                 "char": char_result["char"],
                 "box": char_result["box"],
                 "conf": char_result["score"],  # Rename score -> conf
-                "entropy": char_result["entropy"],  # Preserve entropy
+                "entropy": char_result.get("entropy", 0.0),  # Preserve entropy
             }
             ocr_results.append(ocr_entry)
 
@@ -333,7 +380,10 @@ class DataProcessor:
             char = char_result["char"]
             if char not in entropy_map:
                 entropy_map[char] = {}
-            entropy_map[char][i] = char_result["entropy"]
+            entropy_map[char][i] = char_result.get("entropy", 0.0)
+
+        logger.debug(f"Converted {len(ocr_results)} OCR results for DTW alignment")
+        logger.debug(f"OCR characters: {''.join([r['char'] for r in ocr_results])}")
 
         return ocr_results, entropy_map, full_text
 
