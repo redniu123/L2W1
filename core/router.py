@@ -68,11 +68,21 @@ class Router:
         logger.info(f"Loading Router model: {model_name}")
         
         try:
-            # Load tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-            )
+            # Load tokenizer with offline mode support
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    local_files_only=False,  # Try online first
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load tokenizer online: {e}")
+                logger.info("Trying offline mode (using cached files)...")
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    local_files_only=True,  # Use cached files only
+                )
             
             # Ensure pad token exists
             if self.tokenizer.pad_token is None:
@@ -94,10 +104,21 @@ class Router:
                 else:
                     load_kwargs["device_map"] = device
             
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                **load_kwargs,
-            )
+            # Try loading model (online first, then offline)
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    local_files_only=False,  # Try online first
+                    **load_kwargs,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load model online: {e}")
+                logger.info("Trying offline mode (using cached files)...")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    local_files_only=True,  # Use cached files only
+                    **load_kwargs,
+                )
             
             # Set to evaluation mode (no dropout, etc.)
             self.model.eval()
