@@ -1,0 +1,30 @@
+# === Core Frameworks ===
+torch>=2.1.0
+torchvision
+paddlepaddle-gpu>=2.6.0
+transformers>=4.37.0
+accelerate>=0.26.0
+
+# === OCR & Vision (Agent A) ===
+paddleocr>=2.7.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# === VLM & LLM (Agent B & Router) ===
+modelscope
+qwen-vl-utils
+bitsandbytes>=0.41.0  # For Int4 Quantization
+tiktoken
+sentencepiece
+
+# === Data Engineering (The Pipeline) ===
+numpy>=1.24.0
+scipy
+fastdtw>=0.3.4        # Critical for L2W1-DE-001 (Soft Alignment)
+Levenshtein>=0.23.0   # For CER calculation
+
+# === Development & Utils ===
+tqdm
+pyyaml
+wandb                 # Experiment Tracking
+pytest
