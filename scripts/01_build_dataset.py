@@ -108,7 +108,12 @@ logger = logging.getLogger(__name__)
 def load_chinese_font(font_size: int = 40) -> Optional[ImageFont.FreeTypeFont]:
     """Load a Chinese font for text rendering.
 
+    Priority order:
+    1. Project local fonts (fonts/ directory) - Highest priority
+    2. System fonts (platform-specific)
+
     Tries multiple common font paths on different platforms:
+    - Project local: fonts/wqy-microhei.ttc, fonts/SimHei.ttf, etc.
     - Windows: simhei.ttf, msyh.ttf, simsun.ttc, etc.
     - Linux: NotoSansCJK, WenQuanYi, etc.
     - macOS: PingFang.ttc, STHeiti, etc.
@@ -119,15 +124,59 @@ def load_chinese_font(font_size: int = 40) -> Optional[ImageFont.FreeTypeFont]:
     Returns:
         ImageFont object, or None if no font found.
     """
+    # Get project root directory (parent of scripts/)
+    project_root = Path(__file__).resolve().parent.parent
+    fonts_dir = project_root / "fonts"
+
     system = platform.system()
     font_paths = []
 
+    # ============================================================================
+    # Priority 1: Project local fonts (highest priority)
+    # ============================================================================
+    if fonts_dir.exists():
+        logger.info(f"Scanning project fonts directory: {fonts_dir}")
+        # Common Chinese font filenames in project fonts/ directory
+        project_font_names = [
+            "wqy-microhei.ttc",  # 文泉驿微米黑 (WenQuanYi Micro Hei) - Recommended
+            "wqy-microhei.ttf",  # Alternative extension
+            "wqy-zenhei.ttc",  # 文泉驿正黑
+            "SimHei.ttf",  # 黑体 (already exists in project)
+            "simhei.ttf",  # Alternative name
+            "msyh.ttf",  # 微软雅黑
+            "NotoSansCJK-Regular.ttc",  # Noto Sans CJK
+        ]
+
+        for font_name in project_font_names:
+            font_path = fonts_dir / font_name
+            if font_path.exists():
+                font_paths.append(str(font_path))
+                logger.info(f"  ✓ Found project font: {font_name}")
+
+        # Also scan fonts directory for any .ttf/.ttc files
+        try:
+            for font_file in fonts_dir.iterdir():
+                if font_file.suffix.lower() in [".ttf", ".ttc", ".otf"]:
+                    font_path = str(font_file)
+                    if font_path not in font_paths:
+                        font_paths.append(font_path)
+                        logger.info(
+                            f"  ✓ Found additional project font: {font_file.name}"
+                        )
+        except Exception as e:
+            logger.debug(f"Could not scan project fonts directory: {e}")
+    else:
+        logger.debug(f"Project fonts directory not found: {fonts_dir}")
+
+    # ============================================================================
+    # Priority 2: System fonts (platform-specific)
+    # ============================================================================
     if system == "Windows":
         # Windows common Chinese fonts
         windows_font_dir = os.path.join(
             os.environ.get("WINDIR", "C:\\Windows"), "Fonts"
         )
-        font_paths = [
+        system_font_paths = [
             # Priority: Most common Chinese fonts
             os.path.join(windows_font_dir, "simhei.ttf"),  # 黑体 (SimHei)
             os.path.join(windows_font_dir, "msyh.ttf"),  # 微软雅黑 (Microsoft YaHei)
@@ -139,6 +188,7 @@ def load_chinese_font(font_size: int = 40) -> Optional[ImageFont.FreeTypeFont]:
             os.path.join(windows_font_dir, "STHeiti Light.ttc"),  # 华文黑体
             os.path.join(windows_font_dir, "STSong.ttc"),  # 华文宋体
         ]
+        font_paths.extend(system_font_paths)
 
         # Also try scanning the font directory for any Chinese font
         if os.path.exists(windows_font_dir):
@@ -170,7 +220,7 @@ def load_chinese_font(font_size: int = 40) -> Optional[ImageFont.FreeTypeFont]:
 
     elif system == "Linux":
         # Linux common Chinese fonts
-        font_paths = [
+        system_font_paths = [
             # Noto CJK fonts (most common)
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -188,9 +238,10 @@ def load_chinese_font(font_size: int = 40) -> Optional[ImageFont.FreeTypeFont]:
             # Alternative paths
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Fallback (may not support Chinese)
         ]
+        font_paths.extend(system_font_paths)
     elif system == "Darwin":  # macOS
         # macOS common Chinese fonts
-        font_paths = [
+        system_font_paths = [
             "/System/Library/Fonts/PingFang.ttc",  # 苹方 (PingFang)
             "/System/Library/Fonts/STHeiti Light.ttc",  # 华文黑体
             "/System/Library/Fonts/STSong.ttc",  # 华文宋体
@@ -199,6 +250,7 @@ def load_chinese_font(font_size: int = 40) -> Optional[ImageFont.FreeTypeFont]:
             # Alternative system fonts
             "/System/Library/Fonts/Supplemental/PingFang.ttc",
         ]
+        font_paths.extend(system_font_paths)
 
     # Try to load each font
     loaded_font = None

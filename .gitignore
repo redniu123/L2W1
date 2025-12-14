@@ -1,6 +1,7 @@
 # 排除指定的文件夹
 docs/
 l2w1/
+fonts/
 
 # Python 相关
 __pycache__/
