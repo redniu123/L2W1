@@ -11,6 +11,7 @@ Usage:
 """
 
 import sys
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -29,10 +30,10 @@ logger = logging.getLogger(__name__)
 def download_router_model():
     """Download Router model (Qwen2.5-0.5B)."""
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-    
+
     logger.info(f"Downloading Router model: {model_name}")
     logger.info("This may take a few minutes...")
-    
+
     try:
         # Download tokenizer
         logger.info("Downloading tokenizer...")
@@ -41,7 +42,7 @@ def download_router_model():
             trust_remote_code=True,
         )
         logger.info("Tokenizer downloaded successfully")
-        
+
         # Download model
         logger.info("Downloading model (this is the large file)...")
         model = AutoModelForCausalLM.from_pretrained(
@@ -50,10 +51,12 @@ def download_router_model():
             torch_dtype="auto",
         )
         logger.info("Model downloaded successfully")
-        
-        logger.info(f"Router model cached at: {tokenizer.cache_dir or 'default cache'}")
+
+        # Get HuggingFace cache directory
+        cache_dir = os.getenv("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+        logger.info(f"Router model cached at: {cache_dir}")
         return True
-        
+
     except Exception as e:
         logger.error(f"Failed to download Router model: {e}")
         return False
@@ -62,13 +65,13 @@ def download_router_model():
 def download_agent_b_model():
     """Download Agent B model (Qwen2-VL-2B)."""
     model_name = "Qwen/Qwen2-VL-2B-Instruct"
-    
+
     logger.info(f"Downloading Agent B model: {model_name}")
     logger.info("This may take a few minutes...")
-    
+
     try:
         from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
-        
+
         # Download processor
         logger.info("Downloading processor...")
         processor = AutoProcessor.from_pretrained(
@@ -76,7 +79,7 @@ def download_agent_b_model():
             trust_remote_code=True,
         )
         logger.info("Processor downloaded successfully")
-        
+
         # Download model
         logger.info("Downloading model (this is the large file)...")
         model = Qwen2VLForConditionalGeneration.from_pretrained(
@@ -85,10 +88,12 @@ def download_agent_b_model():
             torch_dtype="auto",
         )
         logger.info("Model downloaded successfully")
-        
-        logger.info(f"Agent B model cached at: {processor.cache_dir or 'default cache'}")
+
+        # Get HuggingFace cache directory
+        cache_dir = os.getenv("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+        logger.info(f"Agent B model cached at: {cache_dir}")
         return True
-        
+
     except Exception as e:
         logger.error(f"Failed to download Agent B model: {e}")
         return False
@@ -103,18 +108,18 @@ def main():
     print("This script will download required models for offline use.")
     print("Make sure you have internet connection!")
     print()
-    
+
     import time
-    
+
     # Download Router model
     print("-" * 70)
     print("Step 1: Downloading Router model (Qwen2.5-0.5B)")
     print("-" * 70)
     router_ok = download_router_model()
     print()
-    
+
     time.sleep(2)
-    
+
     # Download Agent B model (optional)
     print("-" * 70)
     print("Step 2: Downloading Agent B model (Qwen2-VL-2B) [Optional]")
@@ -126,7 +131,7 @@ def main():
         logger.info("Skipping Agent B model download")
         agent_b_ok = False
     print()
-    
+
     # Summary
     print("=" * 70)
     print("Download Summary")
@@ -134,14 +139,14 @@ def main():
     print(f"Router model:  {'✓ Success' if router_ok else '✗ Failed'}")
     print(f"Agent B model: {'✓ Success' if agent_b_ok else '✗ Skipped/Failed'}")
     print()
-    
+
     if router_ok:
         print("✓ Router model is ready for offline use!")
         print("  You can now run scripts with Router enabled.")
     else:
         print("✗ Router model download failed.")
         print("  Router will be disabled (PPL scores will be 0.0)")
-    
+
     print()
     print("Note: Models are cached in HuggingFace cache directory.")
     print("      Default location: ~/.cache/huggingface/")
@@ -150,4 +155,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
