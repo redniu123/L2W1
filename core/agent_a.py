@@ -14,6 +14,7 @@ High entropy = Agent A is "panicking" = likely needs Agent B's help.
 
 import logging
 import math
+import os
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -135,10 +136,21 @@ class AgentA:
         self.use_gpu = use_gpu
         self.lang = lang
 
+        # Set device parameter for PaddleOCR
+        # PaddleOCR 3.x+ uses "device" parameter instead of "use_gpu"
+        device = "gpu" if use_gpu else "cpu"
+
+        # If using CPU, set environment variables to prevent cudnn loading
+        if not use_gpu:
+            # Disable GPU-related environment variables to prevent cudnn errors
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+            logger.info("Using CPU mode - GPU and cudnn will be disabled")
+
         # Build OCR kwargs (compatible with different PaddleOCR versions)
         # PaddleOCR 3.x+ has different API, so we use minimal config first
         ocr_kwargs: Dict[str, Any] = {
             "lang": lang,
+            "device": device,  # Explicitly set device to avoid cudnn issues
         }
 
         # Add optional parameters only if model dirs are provided
@@ -153,20 +165,24 @@ class AgentA:
             # First try with use_angle_cls
             test_kwargs = {**ocr_kwargs, "use_angle_cls": True}
             self.ocr_engine = PaddleOCR(**test_kwargs)
-            logger.info("PaddleOCR initialized with use_angle_cls=True")
+            logger.info(
+                f"PaddleOCR initialized with use_angle_cls=True, device={device}"
+            )
         except (TypeError, AttributeError) as e:
             # If that fails, try without use_angle_cls
             logger.warning(f"PaddleOCR init with use_angle_cls failed: {e}")
             logger.warning("Trying without use_angle_cls...")
             try:
                 self.ocr_engine = PaddleOCR(**ocr_kwargs)
-                logger.info("PaddleOCR initialized with minimal config")
+                logger.info(
+                    f"PaddleOCR initialized with minimal config, device={device}"
+                )
             except Exception as e2:
-                # Last resort: try with just lang
+                # Last resort: try with just lang and device
                 logger.warning(f"PaddleOCR init failed: {e2}")
-                logger.warning("Trying with lang only...")
-                self.ocr_engine = PaddleOCR(lang=lang)
-                logger.info("PaddleOCR initialized with lang only")
+                logger.warning("Trying with lang and device only...")
+                self.ocr_engine = PaddleOCR(lang=lang, device=device)
+                logger.info(f"PaddleOCR initialized with lang and device={device} only")
 
     def inference(
         self,
