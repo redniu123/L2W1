@@ -56,11 +56,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # =============================================================================
 import json
 import logging
+import os
+import platform
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 # =============================================================================
 # Configuration Area (L2W1-DE-003)
@@ -102,6 +105,77 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
+def load_chinese_font(font_size: int = 40) -> Optional[ImageFont.FreeTypeFont]:
+    """Load a Chinese font for text rendering.
+    
+    Tries multiple common font paths on different platforms:
+    - Windows: simhei.ttf, msyh.ttf
+    - Linux/Mac: NotoSansCJK, WenQuanYi, etc.
+    
+    Args:
+        font_size: Font size in pixels.
+    
+    Returns:
+        ImageFont object, or None if no font found.
+    """
+    system = platform.system()
+    font_paths = []
+    
+    if system == "Windows":
+        # Windows common Chinese fonts
+        windows_font_dir = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
+        font_paths = [
+            os.path.join(windows_font_dir, "simhei.ttf"),  # 黑体
+            os.path.join(windows_font_dir, "msyh.ttf"),    # 微软雅黑
+            os.path.join(windows_font_dir, "simsun.ttc"),  # 宋体
+            os.path.join(windows_font_dir, "msyhbd.ttf"),  # 微软雅黑 Bold
+        ]
+    elif system == "Linux":
+        # Linux common Chinese fonts
+        font_paths = [
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/arphic/uming.ttc",
+            "~/.fonts/wqy-microhei.ttc",
+        ]
+    elif system == "Darwin":  # macOS
+        # macOS common Chinese fonts
+        font_paths = [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/Library/Fonts/Microsoft/msyh.ttf",
+            "~/Library/Fonts/NotoSansCJK-Regular.ttc",
+        ]
+    
+    # Try to load each font
+    for font_path in font_paths:
+        # Expand user path (~)
+        font_path = os.path.expanduser(font_path)
+        
+        if os.path.exists(font_path):
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+                logger.info(f"Loaded Chinese font: {font_path}")
+                return font
+            except Exception as e:
+                logger.debug(f"Failed to load font {font_path}: {e}")
+                continue
+    
+    # Fallback: try to use default font (may not support Chinese)
+    try:
+        font = ImageFont.load_default()
+        logger.warning(
+            "No Chinese font found. Using default font (Chinese may display as ?). "
+            "Please install a Chinese font for proper display."
+        )
+        return font
+    except Exception as e:
+        logger.error(f"Failed to load default font: {e}")
+        return None
+
+
 def generate_demo_image(
     output_path: Path,
     text: str = "测试样本123",
@@ -111,6 +185,9 @@ def generate_demo_image(
 
     Creates a white background image with black text for testing
     the pipeline without real data.
+
+    Fixed: Uses PIL ImageDraw with Chinese font support to prevent
+    character display issues (previously showed as ?).
 
     Args:
         output_path: Path to save the generated image.
@@ -122,28 +199,40 @@ def generate_demo_image(
     """
     width, height = size
 
-    # Create white background
-    image = np.ones((height, width, 3), dtype=np.uint8) * 255
+    # Create white background using PIL (supports TrueType fonts)
+    image = Image.new("RGB", (width, height), color=(255, 255, 255))
+    draw = ImageDraw.Draw(image)
 
-    # Add black text (simple approach - actual rendering may vary)
-    # Using OpenCV's putText with a basic font
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 1.5
-    thickness = 2
-    color = (0, 0, 0)  # Black
+    # Load Chinese font (40px for good OCR recognition)
+    font_size = 40
+    font = load_chinese_font(font_size=font_size)
+
+    if font is None:
+        logger.warning("No font available, text may not render correctly")
 
     # Calculate text position (centered)
-    text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
-    x = (width - text_size[0]) // 2
-    y = (height + text_size[1]) // 2
+    if font:
+        # Get text bounding box
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+    else:
+        # Fallback estimation
+        text_width = len(text) * font_size * 0.6  # Approximate
+        text_height = font_size
 
-    cv2.putText(image, text, (x, y), font, font_scale, color, thickness)
+    x = (width - text_width) // 2
+    y = (height - text_height) // 2
+
+    # Draw text
+    color = (0, 0, 0)  # Black
+    draw.text((x, y), text, font=font, fill=color)
 
     # Ensure output directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Save image
-    cv2.imwrite(str(output_path), image)
+    image.save(str(output_path), "PNG")
     logger.info(f"[DEMO] Generated dummy image: {output_path}")
 
     return output_path

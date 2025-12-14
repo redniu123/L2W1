@@ -20,6 +20,16 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
+# Qwen2-VL specific utilities for vision processing
+try:
+    from qwen_vl_utils import process_vision_info
+except ImportError:
+    # Fallback if qwen_vl_utils is not available
+    process_vision_info = None
+    logger.warning(
+        "qwen_vl_utils not found. Install with: pip install qwen-vl-utils"
+    )
+
 logger = logging.getLogger(__name__)
 
 
@@ -190,6 +200,9 @@ OCR 认为这是：'{ocr_pred}'
         
         L2W1-MOD-005: Uses V-CoT prompting to force explicit reasoning.
         
+        Fixed: Uses qwen_vl_utils.process_vision_info to correctly handle
+        image tokens and prevent "Image features and image tokens do not match" error.
+        
         Args:
             crop_image: Character crop image (336x336 PIL Image).
             context_left: Left context text.
@@ -207,6 +220,7 @@ OCR 认为这是：'{ocr_pred}'
         user_prompt = self._build_vcot_prompt(context_left, context_right, ocr_pred)
         
         # Prepare messages for Qwen2-VL format
+        # CRITICAL: Must use this format for process_vision_info to work correctly
         messages = [
             {
                 "role": "system",
@@ -223,44 +237,61 @@ OCR 认为这是：'{ocr_pred}'
             },
         ]
         
-        # Process inputs using Qwen2-VL processor
-        # The processor handles image preprocessing and text tokenization
-        try:
-            # Try Qwen2-VL specific API first
-            if hasattr(self.processor, "process_vision_info"):
-                image_inputs, video_inputs = self.processor.process_vision_info(messages)
-                text = self.processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                inputs = self.processor(
-                    text=[text],
-                    images=image_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt",
-                )
-            else:
-                # Fallback: standard processor API
-                inputs = self.processor(
-                    text=user_prompt,
-                    images=processed_image,
-                    padding=True,
-                    return_tensors="pt",
-                )
-        except Exception as e:
-            logger.warning(f"Qwen2-VL specific API failed: {e}. Trying standard API...")
-            # Fallback to standard processor
-            inputs = self.processor(
-                text=user_prompt,
-                images=processed_image,
-                padding=True,
-                return_tensors="pt",
+        # Process inputs using Qwen2-VL standard API
+        # CRITICAL: Must use qwen_vl_utils.process_vision_info to correctly
+        # insert <|image_pad|> tokens and align image features with tokens
+        
+        if process_vision_info is None:
+            raise RuntimeError(
+                "qwen_vl_utils.process_vision_info is required for Qwen2-VL. "
+                "Install with: pip install qwen-vl-utils"
             )
         
+        # Step 1: Process vision info - this inserts <|image_pad|> tokens correctly
+        # This is the critical step that fixes "Image features and image tokens do not match"
+        messages = process_vision_info(messages)
+        
+        # Step 2: Apply chat template to generate text with image placeholders
+        # This converts messages to text format with proper image token placeholders
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        
+        # Step 3: Extract images from processed messages
+        # After process_vision_info, images may be in PIL.Image format or already processed
+        images = []
+        for msg in messages:
+            if msg.get("role") == "user":
+                for content in msg.get("content", []):
+                    if content.get("type") == "image":
+                        img = content.get("image")
+                        if img is not None:
+                            # Ensure it's a PIL Image
+                            if isinstance(img, Image.Image):
+                                images.append(img)
+                            elif hasattr(img, "image"):  # May be wrapped
+                                images.append(img.image)
+        
+        # Step 4: Process with processor
+        # The processor will tokenize text (with image placeholders from apply_chat_template)
+        # and encode images, ensuring correct alignment
+        # CRITICAL: text already contains <|image_pad|> tokens from process_vision_info
+        inputs = self.processor(
+            text=[text],
+            images=images if images else None,
+            padding=True,
+            return_tensors="pt",
+        )
+        
         # Move inputs to model device
-        inputs = inputs.to(self.device)
+        if hasattr(inputs, "to"):
+            inputs = inputs.to(self.device)
+        else:
+            # Handle dict inputs
+            inputs = {k: v.to(self.device) if hasattr(v, "to") else v 
+                     for k, v in inputs.items()}
         
         # Generate with constraint decoding (L2W1-MOD-005: max_new_tokens=10)
         generated_ids = self.model.generate(
@@ -270,8 +301,10 @@ OCR 认为这是：'{ocr_pred}'
         )
         
         # Decode output
+        # Extract only the newly generated tokens (exclude input)
+        input_ids = inputs.input_ids if isinstance(inputs, dict) else inputs["input_ids"]
         generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(input_ids, generated_ids)
         ]
         
         output_text = self.processor.batch_decode(
