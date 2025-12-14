@@ -14,23 +14,26 @@ Agent B is "The Judge" that reviews uncertain OCR results flagged by Router.
 
 import logging
 import re
-from typing import Optional
+from typing import Optional, Any, Dict, List
 
 import torch
 from PIL import Image
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
+# Initialize logger FIRST (before using it in import blocks)
+logger = logging.getLogger(__name__)
+
 # Qwen2-VL specific utilities for vision processing
 try:
     from qwen_vl_utils import process_vision_info
+    QWEN_VL_UTILS_AVAILABLE = True
 except ImportError:
     # Fallback if qwen_vl_utils is not available
     process_vision_info = None
+    QWEN_VL_UTILS_AVAILABLE = False
     logger.warning(
         "qwen_vl_utils not found. Install with: pip install qwen-vl-utils"
     )
-
-logger = logging.getLogger(__name__)
 
 
 class AgentB:
@@ -188,6 +191,49 @@ OCR 认为这是：'{ocr_pred}'
         
         return crop_image
     
+    def _debug_log_messages(self, messages: List[Dict[str, Any]], label: str = "") -> None:
+        """Debug log messages structure without printing huge image bytes.
+        
+        Args:
+            messages: Messages list to debug.
+            label: Label for the debug output.
+        """
+        logger.debug(f"[DEBUG] {label} Messages structure:")
+        if messages is None:
+            logger.debug(f"  [!] messages is None!")
+            return
+            
+        for i, msg in enumerate(messages):
+            if msg is None:
+                logger.debug(f"  [{i}] Message is None!")
+                continue
+            role = msg.get("role", "UNKNOWN")
+            content = msg.get("content", [])
+            logger.debug(f"  [{i}] role={role}, content type={type(content).__name__}")
+            
+            if isinstance(content, list):
+                for j, item in enumerate(content):
+                    if item is None:
+                        logger.debug(f"      [{j}] Content item is None!")
+                        continue
+                    item_type = item.get("type", "UNKNOWN")
+                    if item_type == "image":
+                        img = item.get("image")
+                        if img is None:
+                            logger.debug(f"      [{j}] type=image, image=None (!)")
+                        elif isinstance(img, Image.Image):
+                            logger.debug(f"      [{j}] type=image, PIL.Image size={img.size}, mode={img.mode}")
+                        else:
+                            logger.debug(f"      [{j}] type=image, image_type={type(img).__name__}")
+                    elif item_type == "text":
+                        text = item.get("text", "")
+                        text_preview = text[:50] + "..." if len(text) > 50 else text
+                        logger.debug(f"      [{j}] type=text, len={len(text)}, preview='{text_preview}'")
+                    else:
+                        logger.debug(f"      [{j}] type={item_type}")
+            elif isinstance(content, str):
+                logger.debug(f"      content (str): '{content[:50]}...'")
+
     @torch.no_grad()
     def inference(
         self,
@@ -200,8 +246,11 @@ OCR 认为这是：'{ocr_pred}'
         
         L2W1-MOD-005: Uses V-CoT prompting to force explicit reasoning.
         
-        Fixed: Uses qwen_vl_utils.process_vision_info to correctly handle
-        image tokens and prevent "Image features and image tokens do not match" error.
+        Enhanced with:
+        - Input validation to prevent None crashes
+        - Defensive programming around process_vision_info
+        - Debug logging for troubleshooting
+        - Guaranteed return value even on errors
         
         Args:
             crop_image: Character crop image (336x336 PIL Image).
@@ -212,111 +261,242 @@ OCR 认为这是：'{ocr_pred}'
         Returns:
             Corrected character string (single character).
             Returns ocr_pred if model outputs "KEEP" or fails.
+            Returns "ERROR" if critical failure occurs.
         """
-        # Preprocess image
-        processed_image = self._preprocess_image(crop_image)
+        # ========================================================================
+        # Step 0: Input Validation (防止 None 崩溃)
+        # ========================================================================
+        logger.debug(f"[AgentB.inference] Starting inference for ocr_pred='{ocr_pred}'")
         
-        # Build V-CoT prompt
-        user_prompt = self._build_vcot_prompt(context_left, context_right, ocr_pred)
+        if crop_image is None:
+            logger.error("[AgentB.inference] crop_image is None! Cannot proceed.")
+            return ocr_pred  # Fallback to original prediction
         
-        # Prepare messages for Qwen2-VL format
-        # CRITICAL: Must use this format for process_vision_info to work correctly
-        messages = [
-            {
-                "role": "system",
-                "content": [
-                    {"type": "text", "text": self.SYSTEM_PROMPT},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": processed_image},
-                    {"type": "text", "text": user_prompt},
-                ],
-            },
-        ]
+        if not isinstance(crop_image, Image.Image):
+            logger.error(f"[AgentB.inference] crop_image is not PIL.Image, got: {type(crop_image)}")
+            return ocr_pred
         
-        # Process inputs using Qwen2-VL standard API
-        # CRITICAL: Must use qwen_vl_utils.process_vision_info to correctly
-        # insert <|image_pad|> tokens and align image features with tokens
+        logger.debug(f"[AgentB.inference] Input image: size={crop_image.size}, mode={crop_image.mode}")
+        logger.debug(f"[AgentB.inference] Context: left='{context_left}', right='{context_right}'")
         
-        if process_vision_info is None:
-            raise RuntimeError(
-                "qwen_vl_utils.process_vision_info is required for Qwen2-VL. "
-                "Install with: pip install qwen-vl-utils"
-            )
+        # Validate context strings
+        context_left = context_left if context_left is not None else ""
+        context_right = context_right if context_right is not None else ""
+        ocr_pred = ocr_pred if ocr_pred is not None else ""
         
-        # Step 1: Process vision info - this inserts <|image_pad|> tokens correctly
-        # This is the critical step that fixes "Image features and image tokens do not match"
-        messages = process_vision_info(messages)
-        
-        # Step 2: Apply chat template to generate text with image placeholders
-        # This converts messages to text format with proper image token placeholders
-        text = self.processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        
-        # Step 3: Extract images from processed messages
-        # After process_vision_info, images may be in PIL.Image format or already processed
-        images = []
-        for msg in messages:
-            if msg.get("role") == "user":
-                for content in msg.get("content", []):
-                    if content.get("type") == "image":
-                        img = content.get("image")
-                        if img is not None:
-                            # Ensure it's a PIL Image
-                            if isinstance(img, Image.Image):
-                                images.append(img)
-                            elif hasattr(img, "image"):  # May be wrapped
-                                images.append(img.image)
-        
-        # Step 4: Process with processor
-        # The processor will tokenize text (with image placeholders from apply_chat_template)
-        # and encode images, ensuring correct alignment
-        # CRITICAL: text already contains <|image_pad|> tokens from process_vision_info
-        inputs = self.processor(
-            text=[text],
-            images=images if images else None,
-            padding=True,
-            return_tensors="pt",
-        )
-        
-        # Move inputs to model device
-        if hasattr(inputs, "to"):
-            inputs = inputs.to(self.device)
-        else:
-            # Handle dict inputs
-            inputs = {k: v.to(self.device) if hasattr(v, "to") else v 
-                     for k, v in inputs.items()}
-        
-        # Generate with constraint decoding (L2W1-MOD-005: max_new_tokens=10)
-        generated_ids = self.model.generate(
-            **inputs,
-            max_new_tokens=10,  # Prevent verbose output
-            do_sample=False,  # Deterministic
-        )
-        
-        # Decode output
-        # Extract only the newly generated tokens (exclude input)
-        input_ids = inputs.input_ids if isinstance(inputs, dict) else inputs["input_ids"]
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(input_ids, generated_ids)
-        ]
-        
-        output_text = self.processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
-        
-        # Clean output to extract single character
-        corrected_char = self._clean_output(output_text, ocr_pred)
-        
-        return corrected_char
+        try:
+            # ====================================================================
+            # Step 1: Preprocess Image
+            # ====================================================================
+            processed_image = self._preprocess_image(crop_image)
+            if processed_image is None:
+                logger.error("[AgentB.inference] _preprocess_image returned None!")
+                return ocr_pred
+            
+            logger.debug(f"[AgentB.inference] Preprocessed image: size={processed_image.size}")
+            
+            # ====================================================================
+            # Step 2: Build V-CoT Prompt
+            # ====================================================================
+            user_prompt = self._build_vcot_prompt(context_left, context_right, ocr_pred)
+            logger.debug(f"[AgentB.inference] User prompt length: {len(user_prompt)}")
+            
+            # ====================================================================
+            # Step 3: Prepare Messages
+            # ====================================================================
+            messages = [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": self.SYSTEM_PROMPT},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": processed_image},
+                        {"type": "text", "text": user_prompt},
+                    ],
+                },
+            ]
+            
+            self._debug_log_messages(messages, "Before process_vision_info")
+            
+            # ====================================================================
+            # Step 4: Process Vision Info (关键步骤，防御性编程)
+            # ====================================================================
+            if not QWEN_VL_UTILS_AVAILABLE or process_vision_info is None:
+                logger.error(
+                    "[AgentB.inference] qwen_vl_utils.process_vision_info is NOT available! "
+                    "Install with: pip install qwen-vl-utils"
+                )
+                return ocr_pred
+            
+            # 调用 process_vision_info，放入 try-except 块
+            try:
+                logger.debug("[AgentB.inference] Calling process_vision_info...")
+                vision_result = process_vision_info(messages)
+                
+                # 检查返回值
+                if vision_result is None:
+                    logger.error("[AgentB.inference] process_vision_info returned None!")
+                    logger.warning("[AgentB.inference] Using original messages as fallback")
+                    # 不覆盖 messages，使用原始的
+                else:
+                    # 检查返回值类型
+                    if isinstance(vision_result, tuple):
+                        # 可能返回 (image_inputs, video_inputs)
+                        logger.debug(f"[AgentB.inference] process_vision_info returned tuple with {len(vision_result)} elements")
+                        if len(vision_result) >= 1:
+                            image_inputs = vision_result[0]
+                            video_inputs = vision_result[1] if len(vision_result) > 1 else None
+                            logger.debug(f"[AgentB.inference] image_inputs type: {type(image_inputs)}, video_inputs type: {type(video_inputs)}")
+                    elif isinstance(vision_result, list):
+                        # 返回处理后的 messages 列表
+                        logger.debug(f"[AgentB.inference] process_vision_info returned list with {len(vision_result)} messages")
+                        messages = vision_result
+                    else:
+                        logger.warning(f"[AgentB.inference] Unexpected return type: {type(vision_result)}")
+                        
+            except TypeError as e:
+                logger.error(f"[AgentB.inference] TypeError in process_vision_info: {e}")
+                logger.warning("[AgentB.inference] Continuing with original messages")
+            except Exception as e:
+                logger.error(f"[AgentB.inference] Exception in process_vision_info: {e}")
+                logger.warning("[AgentB.inference] Continuing with original messages")
+            
+            self._debug_log_messages(messages, "After process_vision_info")
+            
+            # ====================================================================
+            # Step 5: Apply Chat Template
+            # ====================================================================
+            try:
+                text = self.processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                logger.debug(f"[AgentB.inference] Chat template applied, text length: {len(text)}")
+            except Exception as e:
+                logger.error(f"[AgentB.inference] Failed to apply chat template: {e}")
+                return ocr_pred
+            
+            # ====================================================================
+            # Step 6: Extract Images from Processed Messages
+            # ====================================================================
+            images = []
+            if messages is not None:
+                for msg in messages:
+                    if msg is None:
+                        continue
+                    if msg.get("role") == "user":
+                        content = msg.get("content", [])
+                        if content is None:
+                            continue
+                        for item in content:
+                            if item is None:
+                                continue
+                            if item.get("type") == "image":
+                                img = item.get("image")
+                                if img is not None:
+                                    if isinstance(img, Image.Image):
+                                        images.append(img)
+                                    elif hasattr(img, "image"):
+                                        images.append(img.image)
+            
+            logger.debug(f"[AgentB.inference] Extracted {len(images)} images from messages")
+            
+            if not images:
+                logger.warning("[AgentB.inference] No images extracted! Using processed_image directly.")
+                images = [processed_image]
+            
+            # ====================================================================
+            # Step 7: Process with Processor
+            # ====================================================================
+            try:
+                inputs = self.processor(
+                    text=[text],
+                    images=images if images else None,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                logger.debug(f"[AgentB.inference] Processor returned inputs with keys: {list(inputs.keys()) if hasattr(inputs, 'keys') else 'N/A'}")
+            except Exception as e:
+                logger.error(f"[AgentB.inference] Failed to process inputs: {e}")
+                return ocr_pred
+            
+            # Move inputs to model device
+            try:
+                if hasattr(inputs, "to"):
+                    inputs = inputs.to(self.device)
+                else:
+                    inputs = {k: v.to(self.device) if hasattr(v, "to") else v 
+                             for k, v in inputs.items()}
+            except Exception as e:
+                logger.error(f"[AgentB.inference] Failed to move inputs to device: {e}")
+                return ocr_pred
+            
+            # ====================================================================
+            # Step 8: Generate
+            # ====================================================================
+            try:
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=10,
+                    do_sample=False,
+                )
+                logger.debug(f"[AgentB.inference] Generation complete, output shape: {generated_ids.shape}")
+            except Exception as e:
+                logger.error(f"[AgentB.inference] Generation failed: {e}")
+                return ocr_pred
+            
+            # ====================================================================
+            # Step 9: Decode Output
+            # ====================================================================
+            try:
+                # Extract input_ids safely
+                if isinstance(inputs, dict):
+                    input_ids = inputs.get("input_ids")
+                elif hasattr(inputs, "input_ids"):
+                    input_ids = inputs.input_ids
+                else:
+                    logger.error("[AgentB.inference] Cannot find input_ids in inputs!")
+                    return ocr_pred
+                
+                if input_ids is None:
+                    logger.error("[AgentB.inference] input_ids is None!")
+                    return ocr_pred
+                
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(input_ids, generated_ids)
+                ]
+                
+                output_text = self.processor.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )[0]
+                
+                logger.debug(f"[AgentB.inference] Decoded output: '{output_text}'")
+                
+            except Exception as e:
+                logger.error(f"[AgentB.inference] Failed to decode output: {e}")
+                return ocr_pred
+            
+            # ====================================================================
+            # Step 10: Clean Output
+            # ====================================================================
+            corrected_char = self._clean_output(output_text, ocr_pred)
+            logger.info(f"[AgentB.inference] Result: '{ocr_pred}' -> '{corrected_char}'")
+            
+            return corrected_char
+            
+        except Exception as e:
+            # 捕获所有未预期的异常
+            logger.error(f"[AgentB.inference] Unexpected error: {e}")
+            import traceback
+            logger.error(f"[AgentB.inference] Full traceback:\n{traceback.format_exc()}")
+            return ocr_pred  # 永远返回一个值，不让脚本崩溃
     
     def _clean_output(
         self,
