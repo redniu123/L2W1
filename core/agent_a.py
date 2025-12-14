@@ -144,6 +144,9 @@ class AgentA:
         if not use_gpu:
             # Disable GPU-related environment variables to prevent cudnn errors
             os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+            os.environ.setdefault(
+                "FLAGS_use_mkldnn", "0"
+            )  # Disable MKLDNN to avoid instruction set issues
             logger.info("Using CPU mode - GPU and cudnn will be disabled")
 
         # Build OCR kwargs (compatible with different PaddleOCR versions)
@@ -178,11 +181,42 @@ class AgentA:
                     f"PaddleOCR initialized with minimal config, device={device}"
                 )
             except Exception as e2:
-                # Last resort: try with just lang and device
-                logger.warning(f"PaddleOCR init failed: {e2}")
-                logger.warning("Trying with lang and device only...")
-                self.ocr_engine = PaddleOCR(lang=lang, device=device)
-                logger.info(f"PaddleOCR initialized with lang and device={device} only")
+                # Check if it's a cudnn error and we're trying to use GPU
+                error_str = str(e2).lower()
+                if use_gpu and ("cudnn" in error_str or "cuda" in error_str):
+                    logger.error(f"GPU initialization failed: {e2}")
+                    logger.warning(
+                        "GPU is not available or cudnn is not properly configured."
+                    )
+                    logger.warning("Falling back to CPU mode...")
+                    # Retry with CPU
+                    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+                    os.environ.setdefault("FLAGS_use_mkldnn", "0")
+                    device = "cpu"
+                    self.use_gpu = False
+                    ocr_kwargs["device"] = device
+                    try:
+                        self.ocr_engine = PaddleOCR(**ocr_kwargs)
+                        logger.info(
+                            "PaddleOCR initialized with CPU (fallback from GPU)"
+                        )
+                    except Exception as e3:
+                        logger.error(f"CPU initialization also failed: {e3}")
+                        raise
+                else:
+                    # Last resort: try with just lang and device
+                    logger.warning(f"PaddleOCR init failed: {e2}")
+                    logger.warning("Trying with lang and device only...")
+                    try:
+                        self.ocr_engine = PaddleOCR(lang=lang, device=device)
+                        logger.info(
+                            f"PaddleOCR initialized with lang and device={device} only"
+                        )
+                    except Exception as e3:
+                        logger.error(
+                            f"All PaddleOCR initialization attempts failed. Last error: {e3}"
+                        )
+                        raise
 
     def inference(
         self,

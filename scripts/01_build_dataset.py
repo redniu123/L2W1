@@ -22,17 +22,23 @@ Demo Mode:
 # =============================================================================
 import os
 
-# Set environment variables to prevent cudnn loading when using CPU
-# This must be done BEFORE importing any PaddleOCR/PaddlePaddle modules
+# Determine if we should use CPU mode
 # Default to GPU mode, disable only if USE_CPU=true or USE_GPU=false
-use_cpu = (
+use_cpu_env = (
     os.getenv("USE_CPU", "false").lower() == "true"
     or os.getenv("USE_GPU", "true").lower() == "false"
 )
-if use_cpu:
+
+# Set environment variables to prevent cudnn loading when using CPU
+# This must be done BEFORE importing any PaddleOCR/PaddlePaddle modules
+if use_cpu_env:
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
     # Prevent PaddlePaddle from trying to load cudnn on CPU-only systems
     os.environ.setdefault("FLAGS_cudnn_deterministic", "1")
+    # Disable MKLDNN to avoid instruction set compatibility issues
+    os.environ.setdefault("FLAGS_use_mkldnn", "0")
+    # Use basic CPU operations
+    os.environ.setdefault("FLAGS_cpu_deterministic", "1")
 
 # =============================================================================
 # Path Patching (L2W1-DE-003 Requirement)
@@ -236,16 +242,75 @@ def run_pipeline(
     logger.info("Initializing DataProcessor (Agent A: PaddleOCR)...")
     logger.info("=" * 60)
 
-    try:
-        processor = DataProcessor(
-            output_dir=crops_dir,
-            target_size=336,
-            context_alpha=0.3,
-            use_gpu=use_gpu,
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize DataProcessor: {e}")
-        raise
+    # Try to initialize with requested GPU setting, with automatic fallback
+    processor = None
+    actual_use_gpu = use_gpu
+
+    if use_gpu:
+        logger.info("Attempting to initialize with GPU...")
+        try:
+            processor = DataProcessor(
+                output_dir=crops_dir,
+                target_size=336,
+                context_alpha=0.3,
+                use_gpu=True,
+            )
+            logger.info("✓ Successfully initialized with GPU")
+        except Exception as e:
+            logger.warning(f"GPU initialization failed: {e}")
+            logger.warning("Falling back to CPU mode...")
+            actual_use_gpu = False
+            # Set CPU environment variables before retry
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+            os.environ.setdefault("FLAGS_cudnn_deterministic", "1")
+            os.environ.setdefault("FLAGS_use_mkldnn", "0")
+            os.environ.setdefault("FLAGS_cpu_deterministic", "1")
+
+    if processor is None:
+        logger.info("Initializing with CPU mode...")
+        try:
+            processor = DataProcessor(
+                output_dir=crops_dir,
+                target_size=336,
+                context_alpha=0.3,
+                use_gpu=False,
+            )
+            logger.info("✓ Successfully initialized with CPU")
+        except Exception as e:
+            error_str = str(e).lower()
+            logger.error(f"Failed to initialize DataProcessor (CPU mode): {e}")
+
+            if "illegal instruction" in error_str or "sigill" in error_str:
+                logger.error("=" * 60)
+                logger.error("CPU INSTRUCTION SET INCOMPATIBILITY DETECTED")
+                logger.error("=" * 60)
+                logger.error(
+                    "Your CPU does not support the instruction sets required by"
+                )
+                logger.error("the installed PaddlePaddle version.")
+                logger.error("")
+                logger.error("Solutions:")
+                logger.error("1. Install CPU-compatible PaddlePaddle:")
+                logger.error("   pip uninstall paddlepaddle-gpu")
+                logger.error("   pip install paddlepaddle")
+                logger.error("")
+                logger.error("2. Use GPU mode (if available):")
+                logger.error("   python scripts/01_build_dataset.py")
+                logger.error("")
+                logger.error("3. Use a system with a newer CPU that supports AVX/AVX2")
+                logger.error("=" * 60)
+            elif "cudnn" in error_str:
+                logger.error("CUDA/cudnn error detected. Make sure:")
+                logger.error("1. CUDA and cudnn are properly installed")
+                logger.error("2. GPU drivers are up to date")
+                logger.error(
+                    "3. Or use CPU mode: USE_CPU=true python scripts/01_build_dataset.py"
+                )
+            else:
+                logger.error(
+                    "Try installing a compatible PaddlePaddle version or use GPU mode."
+                )
+            raise
 
     logger.info(f"DataProcessor initialized successfully.")
     logger.info(f"  - Output crops: {crops_dir}")
