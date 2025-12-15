@@ -222,6 +222,7 @@ class AgentA:
         self,
         image: Union[np.ndarray, str],
         return_raw: bool = False,
+        skip_detection: bool = False,
     ) -> List[Dict[str, Any]]:
         """Run OCR inference and compute entropy metrics.
 
@@ -249,9 +250,12 @@ class AgentA:
             See class docstring for details on obtaining true char-level scores.
         """
         # Run PaddleOCR
+        # For cropped single-character images, skip_detection avoids DBNet failure.
         raw_results = self.ocr_engine.ocr(
             image if isinstance(image, str) else image,
-            cls=True,
+            cls=not skip_detection,
+            det=not skip_detection,
+            rec=True,
         )
 
         # Handle empty results
@@ -429,6 +433,7 @@ class AgentA:
     def inference_with_char_boxes(
         self,
         image: Union[np.ndarray, str],
+        skip_detection: bool = False,
     ) -> List[Dict[str, Any]]:
         """Run inference and return character-level bounding boxes.
 
@@ -450,7 +455,7 @@ class AgentA:
                 "char_index": 0
             }
         """
-        line_results = self.inference(image)
+        line_results = self.inference(image, skip_detection=skip_detection)
         char_results: List[Dict[str, Any]] = []
 
         for line in line_results:

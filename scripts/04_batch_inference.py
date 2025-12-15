@@ -165,9 +165,11 @@ class L2W1Pipeline:
         ppl_threshold: float = PPL_THRESHOLD,
         entropy_threshold: float = ENTROPY_THRESHOLD,
         use_gpu: bool = True,
+        skip_detection: bool = False,
     ):
         self.ppl_threshold = ppl_threshold
         self.entropy_threshold = entropy_threshold
+        self.skip_detection = skip_detection
         self.agent_a = None
         self.router = None
         self.agent_b = None
@@ -249,12 +251,36 @@ class L2W1Pipeline:
             is_routed=False,
             is_correct=False,
         )
-        
+
         try:
+            # If no OCR prediction, run Agent A (supports rec-only mode)
+            if (pred_a is None or pred_a == "") and self.agent_a is not None and image is not None:
+                try:
+                    line_results = self.agent_a.inference(
+                        image,
+                        skip_detection=self.skip_detection,
+                    )
+                    if line_results:
+                        # Use first line result for single-character images
+                        first_line = line_results[0]
+                        pred_a = first_line.get("text", pred_a)
+                        entropy = first_line.get("max_entropy", entropy)
+                        # Update in result
+                        result.pred_a = pred_a
+                        result.pred_final = pred_a
+                        # Recompute ppl based on new text
+                        if self.router is not None and pred_a:
+                            try:
+                                ppl = self.router.compute_ppl(pred_a)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    result.error = f"Agent A error: {e}"
+
             # Routing decision
             is_routed = self.should_route(entropy, ppl)
             result.is_routed = is_routed
-            
+
             # Agent B correction if needed
             if is_routed and self.agent_b is not None and image is not None:
                 try:
@@ -267,10 +293,10 @@ class L2W1Pipeline:
                     result.pred_final = corrected
                 except Exception as e:
                     result.error = f"Agent B error: {e}"
-            
+
             # Check correctness
             result.is_correct = (result.pred_final == gt)
-            
+
         except Exception as e:
             result.error = str(e)
         
@@ -411,6 +437,11 @@ def parse_args() -> argparse.Namespace:
         help=f"PPL threshold (default: {PPL_THRESHOLD})",
     )
     parser.add_argument(
+        "--rec_only",
+        action="store_true",
+        help="Recognition-only mode (skip detection) for cropped single-character images",
+    )
+    parser.add_argument(
         "--cpu",
         action="store_true",
         help="Use CPU only",
@@ -466,9 +497,17 @@ def main() -> None:
     print("  Initializing Pipeline...")
     print("-" * 70)
     
+    # Enable rec_only automatically for CASIA single-character set
+    auto_rec_only = "casia" in test_set_path.name.lower()
+    rec_only_flag = args.rec_only or auto_rec_only
+
+    if auto_rec_only and not args.rec_only:
+        logger.info("Auto-enabling rec_only mode for CASIA test set (skip detection).")
+
     pipeline = L2W1Pipeline(
         ppl_threshold=args.ppl_threshold,
         use_gpu=not args.cpu,
+        skip_detection=rec_only_flag,
     )
     
     # Run inference
