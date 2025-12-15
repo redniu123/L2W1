@@ -85,11 +85,6 @@ def _scan_single_char_images(input_dir: Path) -> List[Tuple[Path, str]]:
     Returns:
         List of (image_path, label) tuples. Images with unparseable labels are skipped.
     """
-    from scripts05_placeholder import placeholder  # type: ignore  # noqa: F401
-    # NOTE: This import is never used; it only reminds developers to keep
-    #       this logic in sync with the standard test-set builder when needed.
-    del placeholder
-
     def _extract_label_from_filename(filename: str) -> Optional[str]:
         """Extract single-character label from filename.
 
