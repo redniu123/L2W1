@@ -276,8 +276,8 @@ class SlidingWindowPipeline:
         # ===== Agent A: OCR =====
         if self.agent_a is not None:
             try:
-                # Use detection mode for text line segments
-                line_results = self.agent_a.inference(window_rgb, skip_detection=False)
+                # Use recognition-only mode for sliding windows (skip detection)
+                line_results = self.agent_a.inference(window_rgb, skip_detection=True)
                 
                 if line_results:
                     ocr_text = "".join([r.get("text", "") for r in line_results])
@@ -412,9 +412,9 @@ def run_sliding_window_inference(
         ocr_pred = result["ocr_pred"]
         l2w1_pred = result["l2w1_pred"]
         
-        # Deduplicate overlapping characters
-        ocr_to_add = deduplicate_overlap(full_text_ocr, ocr_pred)
-        l2w1_to_add = deduplicate_overlap(full_text_l2w1, l2w1_pred)
+        # Deduplicate overlapping characters (small overlap ~1 char)
+        ocr_to_add = deduplicate_overlap(full_text_ocr, ocr_pred, overlap_chars=1)
+        l2w1_to_add = deduplicate_overlap(full_text_l2w1, l2w1_pred, overlap_chars=1)
         
         # Accumulate
         full_text_ocr += ocr_to_add
