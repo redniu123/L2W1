@@ -412,9 +412,9 @@ def run_sliding_window_inference(
         ocr_pred = result["ocr_pred"]
         l2w1_pred = result["l2w1_pred"]
         
-        # Deduplicate overlapping characters (small overlap ~1 char)
-        ocr_to_add = deduplicate_overlap(full_text_ocr, ocr_pred, overlap_chars=1)
-        l2w1_to_add = deduplicate_overlap(full_text_l2w1, l2w1_pred, overlap_chars=1)
+        # Deduplicate overlapping characters (overlap ~1-2 chars due to 40px overlap)
+        ocr_to_add = deduplicate_overlap(full_text_ocr, ocr_pred, overlap_chars=2)
+        l2w1_to_add = deduplicate_overlap(full_text_l2w1, l2w1_pred, overlap_chars=2)
         
         # Accumulate
         full_text_ocr += ocr_to_add
