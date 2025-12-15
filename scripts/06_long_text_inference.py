@@ -94,6 +94,7 @@ def load_and_normalize_image(
     normalized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     
     logger.info(f"Image normalized: {w}x{h} -> {new_w}x{new_h} (scale: {scale:.3f})")
+    logger.debug(f"[DEBUG] Resized Image Shape: {normalized.shape}")
     
     return normalized, original_size
 
@@ -435,6 +436,8 @@ def run_sliding_window_inference(
         print(f"    L2W1: '{l2w1_pred}' {routed_flag}")
         print(f"    PPL:  {result['ppl_score']:.2f} | Entropy: {result['entropy']:.4f}")
         print(f"    Context: '...{context_preview}'")
+        print(f"    [DEBUG] Window {i+1} OCR added: '{ocr_to_add}'")
+        print(f"    [DEBUG] Window {i+1} L2W1 added: '{l2w1_to_add}'")
         print()
     
     # Final results
