@@ -17,6 +17,7 @@ import math
 import os
 from typing import Any, Dict, List, Optional, Union
 
+import cv2
 import numpy as np
 from paddleocr import PaddleOCR
 
@@ -71,6 +72,72 @@ def compute_char_entropies(scores: List[float]) -> List[float]:
         List of entropy values, same length as scores.
     """
     return [binary_entropy(s) for s in scores]
+
+
+def pad_square_image_for_ocr(
+    image: np.ndarray,
+    padding_ratio: float = 0.3,
+    fill_color: tuple = (255, 255, 255),
+) -> np.ndarray:
+    """Pad a square image with white borders to make it look like a text line.
+
+    When using PaddleOCR with det=False (recognition-only mode) on cropped
+    single-character images, the recognition model expects a horizontally
+    elongated text line image. Square images get distorted.
+
+    This function adds white padding to the left and right sides of square
+    images to simulate a short text line format.
+
+    Args:
+        image: Input image as numpy array [H, W, C].
+        padding_ratio: Ratio of padding width relative to image width.
+            Default 0.3 means 30% padding on each side.
+        fill_color: RGB color for padding. Default is white (255, 255, 255).
+
+    Returns:
+        Padded image as numpy array.
+    """
+    h, w = image.shape[:2]
+
+    # Check if image is roughly square (aspect ratio close to 1:1)
+    aspect_ratio = w / h if h > 0 else 1.0
+
+    # Only pad if image is square-ish (aspect ratio between 0.7 and 1.5)
+    if 0.7 <= aspect_ratio <= 1.5:
+        # Calculate padding width
+        pad_width = int(w * padding_ratio)
+
+        # Create padded image using cv2.copyMakeBorder
+        if len(image.shape) == 3:
+            # Color image
+            padded = cv2.copyMakeBorder(
+                image,
+                top=0,
+                bottom=0,
+                left=pad_width,
+                right=pad_width,
+                borderType=cv2.BORDER_CONSTANT,
+                value=fill_color,
+            )
+        else:
+            # Grayscale image
+            padded = cv2.copyMakeBorder(
+                image,
+                top=0,
+                bottom=0,
+                left=pad_width,
+                right=pad_width,
+                borderType=cv2.BORDER_CONSTANT,
+                value=fill_color[0],  # Use single value for grayscale
+            )
+
+        logger.debug(
+            f"Padded square image: {w}x{h} -> {padded.shape[1]}x{padded.shape[0]} "
+            f"(added {pad_width}px on each side)"
+        )
+        return padded
+
+    return image
 
 
 # =============================================================================
@@ -231,6 +298,8 @@ class AgentA:
         Args:
             image: Input image as numpy array [H, W, C] or file path string.
             return_raw: If True, also return raw PaddleOCR output.
+            skip_detection: If True, skip text detection (det=False).
+                Use this for pre-cropped single-character images.
 
         Returns:
             List of dicts, where each dict represents a text line:
@@ -249,71 +318,230 @@ class AgentA:
             Currently uses line-level score distributed to characters.
             See class docstring for details on obtaining true char-level scores.
         """
-        # Run PaddleOCR
-        # For cropped single-character images, skip_detection avoids DBNet failure.
-        raw_results = self.ocr_engine.ocr(
-            image if isinstance(image, str) else image,
-            cls=not skip_detection,
-            det=not skip_detection,
-            rec=True,
-        )
+        # =====================================================================
+        # Step 1: Load and preprocess image
+        # =====================================================================
+        if isinstance(image, str):
+            # Load image from file path
+            img_array = cv2.imread(image)
+            if img_array is None:
+                logger.error(f"Failed to load image: {image}")
+                return []
+            # Convert BGR to RGB (PaddleOCR expects RGB)
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+        elif hasattr(image, "mode"):
+            # PIL Image - convert to numpy array
+            from PIL import Image as PILImage
+
+            if isinstance(image, PILImage.Image):
+                img_array = np.array(image)
+                # Ensure RGB format
+                if len(img_array.shape) == 2:
+                    # Grayscale, convert to RGB
+                    img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
+                elif img_array.shape[2] == 4:
+                    # RGBA, convert to RGB
+                    img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
+            else:
+                img_array = image
+        else:
+            img_array = image
+
+        # =====================================================================
+        # Step 2: Apply padding for square images (rec-only mode)
+        # =====================================================================
+        if skip_detection:
+            # Pad square images to make them look like text lines
+            # This prevents distortion in the recognition model
+            img_array = pad_square_image_for_ocr(
+                img_array,
+                padding_ratio=0.3,  # 30% padding on each side
+                fill_color=(255, 255, 255),  # White background
+            )
+            logger.debug("Running OCR in recognition-only mode (det=False)")
+
+        # =====================================================================
+        # Step 3: Run PaddleOCR
+        # =====================================================================
+        try:
+            raw_results = self.ocr_engine.ocr(
+                img_array,
+                cls=not skip_detection,
+                det=not skip_detection,
+                rec=True,
+            )
+        except Exception as e:
+            logger.error(f"PaddleOCR inference failed: {e}")
+            return []
 
         # Handle empty results
         if raw_results is None or len(raw_results) == 0:
+            logger.debug("PaddleOCR returned None or empty results")
             return []
 
         if raw_results[0] is None:
+            logger.debug("PaddleOCR first result is None")
             return []
 
-        # Process each detected text line
+        # =====================================================================
+        # Step 4: Parse results (different structure for det=True vs det=False)
+        # =====================================================================
         results: List[Dict[str, Any]] = []
 
-        for line_result in raw_results[0]:
-            if line_result is None:
-                continue
+        # When det=False (skip_detection=True):
+        #   Return structure: [[(text, score), (text2, score2), ...]]
+        # When det=True:
+        #   Return structure: [[[box, (text, score)], [box2, (text2, score2)], ...]]
 
-            box_points, (text, line_score) = line_result
+        if skip_detection:
+            # Recognition-only mode: result is [[(text, score), ...]]
+            rec_results = raw_results[0]
 
-            if not text:
-                continue
+            logger.debug(
+                f"rec_results type: {type(rec_results)}, content: {rec_results}"
+            )
 
-            # Get character-level scores
-            # NOTE: PaddleOCR default only provides line-level score.
-            # We distribute it to all characters as an approximation.
-            # For true char-level scores, need to access model internals.
-            char_scores = self._get_char_scores(text, line_score)
+            # Handle various possible return formats
+            if rec_results is None:
+                return []
 
-            # Compute entropies
-            char_entropies = compute_char_entropies(char_scores)
-            avg_entropy = sum(char_entropies) / len(char_entropies)
-            max_entropy = max(char_entropies)
+            # Sometimes it's nested differently, try to extract (text, score) tuples
+            items_to_process = []
 
-            # Find uncertain characters (entropy > 50% of max possible)
-            entropy_threshold = self.MAX_ENTROPY * 0.5  # ≈ 0.346
-            uncertain_chars = [
-                {"char": text[i], "index": i, "entropy": e}
-                for i, e in enumerate(char_entropies)
-                if e > entropy_threshold
-            ]
+            if isinstance(rec_results, list):
+                if len(rec_results) == 0:
+                    return []
 
-            # Build result dict
-            line_result_dict: Dict[str, Any] = {
-                "text": text,
-                "box": box_points,
-                "line_score": float(line_score),
-                "scores": char_scores,
-                "entropies": char_entropies,
-                "avg_entropy": avg_entropy,
-                "max_entropy": max_entropy,
-                "uncertain_chars": uncertain_chars,
-            }
+                # Check first element to determine structure
+                first_elem = rec_results[0]
 
-            if return_raw:
-                line_result_dict["raw"] = line_result
+                if isinstance(first_elem, tuple) and len(first_elem) == 2:
+                    # Format: [(text, score), ...]
+                    items_to_process = rec_results
+                elif isinstance(first_elem, list):
+                    # Format: [[(text, score), ...]] - nested
+                    items_to_process = first_elem
+                else:
+                    # Unknown format, try to use as-is
+                    items_to_process = rec_results
+            elif isinstance(rec_results, tuple) and len(rec_results) == 2:
+                # Single result: (text, score)
+                items_to_process = [rec_results]
 
-            results.append(line_result_dict)
+            # Process each (text, score) tuple
+            for item in items_to_process:
+                if item is None:
+                    continue
+
+                # Extract text and score
+                if isinstance(item, tuple) and len(item) >= 2:
+                    text = item[0]
+                    line_score = item[1]
+                elif isinstance(item, list) and len(item) >= 2:
+                    text = item[0]
+                    line_score = item[1]
+                else:
+                    logger.warning(f"Unexpected item format in rec results: {item}")
+                    continue
+
+                if not text:
+                    continue
+
+                # For rec-only mode, create a dummy box covering the whole image
+                h, w = img_array.shape[:2]
+                box_points = [[0, 0], [w, 0], [w, h], [0, h]]
+
+                # Build result
+                result_dict = self._build_result_dict(
+                    text, line_score, box_points, return_raw, item
+                )
+                if result_dict:
+                    results.append(result_dict)
+                    logger.debug(f"Recognized text: '{text}' (score: {line_score:.4f})")
+
+        else:
+            # Detection mode: result is [[[box, (text, score)], ...]]
+            for line_result in raw_results[0]:
+                if line_result is None:
+                    continue
+
+                try:
+                    box_points, (text, line_score) = line_result
+                except (ValueError, TypeError) as e:
+                    logger.warning(
+                        f"Failed to unpack line result: {line_result}, error: {e}"
+                    )
+                    continue
+
+                if not text:
+                    continue
+
+                # Build result
+                result_dict = self._build_result_dict(
+                    text, line_score, box_points, return_raw, line_result
+                )
+                if result_dict:
+                    results.append(result_dict)
 
         return results
+
+    def _build_result_dict(
+        self,
+        text: str,
+        line_score: float,
+        box_points: List,
+        return_raw: bool,
+        raw_item: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Build a result dictionary for a recognized text line.
+
+        Args:
+            text: Recognized text string.
+            line_score: Confidence score for the line.
+            box_points: Bounding box points.
+            return_raw: Whether to include raw result.
+            raw_item: Raw result item for debugging.
+
+        Returns:
+            Result dictionary or None if invalid.
+        """
+        if not text:
+            return None
+
+        # Get character-level scores
+        char_scores = self._get_char_scores(text, line_score)
+
+        # Compute entropies
+        char_entropies = compute_char_entropies(char_scores)
+        avg_entropy = (
+            sum(char_entropies) / len(char_entropies) if char_entropies else 0.0
+        )
+        max_entropy = max(char_entropies) if char_entropies else 0.0
+
+        # Find uncertain characters (entropy > 50% of max possible)
+        entropy_threshold = self.MAX_ENTROPY * 0.5  # ≈ 0.346
+        uncertain_chars = [
+            {"char": text[i], "index": i, "entropy": e}
+            for i, e in enumerate(char_entropies)
+            if e > entropy_threshold
+        ]
+
+        # Build result dict
+        result_dict: Dict[str, Any] = {
+            "text": text,
+            "box": box_points,
+            "line_score": float(line_score),
+            "scores": char_scores,
+            "entropies": char_entropies,
+            "avg_entropy": avg_entropy,
+            "max_entropy": max_entropy,
+            "uncertain_chars": uncertain_chars,
+        }
+
+        if return_raw:
+            result_dict["raw"] = raw_item
+
+        return result_dict
 
     def _get_char_scores(
         self,
