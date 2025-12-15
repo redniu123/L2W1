@@ -61,34 +61,46 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 def extract_label_from_filename(filename: str) -> Optional[str]:
-    """Extract Chinese character label from filename.
-    
-    Expected formats:
-    - 测_123.jpg -> 测
-    - 测.jpg -> 测
+    """Extract single-character label from filename.
+
+    Priority:
+    1) Split by "_" and, if the first segment has length 1 (any character),
+       return it directly as the label.
+    2) Otherwise, fall back to finding the first Chinese character.
+    3) Finally, try to decode a 4-hex-digit Unicode code point at the
+       beginning of the filename.
+
+    Expected formats (examples):
+    - 测_123.jpg      -> 测
+    - 测.jpg          -> 测
     - char_测_001.png -> 测
-    - 测试_1.jpg -> 测 (first character)
-    
+    - 测试_1.jpg       -> 测 (first Chinese character)
+    - A_001.png       -> A
+    - ~_00201.jpg     -> ~
+
     Args:
         filename: Image filename (without path).
-        
+
     Returns:
-        Extracted Chinese character, or None if not found.
+        Extracted single-character label, or None if not found.
     """
     # Remove extension
-    name = Path(filename).stem
-    
-    # Strategy 1: Find first Chinese character
-    matches = CHINESE_CHAR_PATTERN.findall(name)
+    name: str = Path(filename).stem
+
+    # Strategy 1: Split by "_" and use single-character prefix directly
+    # e.g., "~_00201", "A_001", "测_123"
+    parts: List[str] = name.split("_")
+    if parts and len(parts[0]) == 1:
+        return parts[0]
+
+    # Strategy 2: Find first Chinese character anywhere in the name
+    matches: List[str] = CHINESE_CHAR_PATTERN.findall(name)
     if matches:
         return matches[0]  # Return first Chinese character
-    
-    # Strategy 2: Check if filename starts with underscore pattern
-    # e.g., _测_123 or _12345 (CASIA format uses numeric codes)
-    
+
     # Strategy 3: Try to decode from potential Unicode code point
     # CASIA sometimes uses hex codes like "6d4b" for "测"
-    hex_pattern = re.compile(r'^([0-9a-fA-F]{4})(?:_|$)')
+    hex_pattern = re.compile(r"^([0-9a-fA-F]{4})(?:_|$)")
     hex_match = hex_pattern.match(name)
     if hex_match:
         try:
@@ -96,8 +108,9 @@ def extract_label_from_filename(filename: str) -> Optional[str]:
             if CHINESE_CHAR_PATTERN.match(char):
                 return char
         except (ValueError, OverflowError):
+            # Fail silently here and let the caller handle None
             pass
-    
+
     return None
 
 
