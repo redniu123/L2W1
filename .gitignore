@@ -2,6 +2,7 @@
 docs/
 l2w1/
 fonts/
+my_models/
 
 # Python 相关
 __pycache__/
@@ -24,6 +25,8 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.tar.gz
+
 
 # 虚拟环境
 venv/
