@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Batch Inference for Paper Experiments.
+"""Batch Inference for Paper Experiments with CER Evaluation.
 
-Generates core metrics for the L2W1 paper experiments section.
+Generates core metrics for the L2W1 paper experiments section using
+Character Error Rate (CER) instead of exact match.
 
 Metrics:
 1. Total Samples
-2. Baseline Accuracy (Agent A only)
-3. L2W1 Accuracy (Ours)
+2. Baseline Accuracy (Agent A only) - CER-based
+3. L2W1 Accuracy (Ours) - CER-based
 4. Router Activation Rate
 5. Correction Success Rate
 
@@ -45,6 +46,7 @@ import argparse
 import csv
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -61,6 +63,15 @@ except ImportError:
     TQDM_AVAILABLE = False
     print("[WARN] tqdm not installed. Progress bar disabled.")
 
+try:
+    from Levenshtein import distance as levenshtein_distance
+except ImportError:
+    logger.warning("python-Levenshtein not installed. Installing...")
+    import subprocess
+
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "python-Levenshtein"])
+    from Levenshtein import distance as levenshtein_distance
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -73,6 +84,7 @@ OUTPUT_CSV = PROJECT_ROOT / "output" / "batch_eval_details.csv"
 # Thresholds
 PPL_THRESHOLD = 100.0
 ENTROPY_THRESHOLD = 0.3
+CER_THRESHOLD = 0.1  # CER < 0.1 means "basically correct" (90% accuracy)
 
 # Logging
 logging.basicConfig(
@@ -81,6 +93,90 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Text Normalization
+# =============================================================================
+
+
+def normalize_text(text: str) -> str:
+    """Normalize text for CER calculation.
+
+    Steps:
+    1. Remove all whitespace
+    2. Convert English punctuation to Chinese punctuation
+
+    Args:
+        text: Input text string.
+
+    Returns:
+        Normalized text string.
+    """
+    if not text:
+        return ""
+
+    # Remove all whitespace
+    normalized = re.sub(r"\s+", "", text)
+
+    # Convert English punctuation to Chinese punctuation
+    punctuation_map = {
+        ",": "，",
+        ".": "。",
+        ":": "：",
+        ";": "；",
+        "!": "！",
+        "?": "？",
+    }
+
+    for en_punct, zh_punct in punctuation_map.items():
+        normalized = normalized.replace(en_punct, zh_punct)
+
+    return normalized
+
+
+# =============================================================================
+# CER Calculation
+# =============================================================================
+
+
+def compute_cer(pred: str, gt: str) -> float:
+    """Compute Character Error Rate (CER).
+
+    CER = Levenshtein.distance(pred, gt) / len(gt)
+
+    Args:
+        pred: Predicted text.
+        gt: Ground truth text.
+
+    Returns:
+        CER value (0.0 = perfect match, 1.0 = completely wrong).
+    """
+    pred_norm = normalize_text(pred)
+    gt_norm = normalize_text(gt)
+
+    if len(gt_norm) == 0:
+        # If GT is empty, CER is 0 if pred is also empty, else 1.0
+        return 0.0 if len(pred_norm) == 0 else 1.0
+
+    distance = levenshtein_distance(pred_norm, gt_norm)
+    cer = distance / len(gt_norm)
+    return cer
+
+
+def is_correct_by_cer(pred: str, gt: str, threshold: float = CER_THRESHOLD) -> bool:
+    """Check if prediction is correct based on CER threshold.
+
+    Args:
+        pred: Predicted text.
+        gt: Ground truth text.
+        threshold: CER threshold (default: 0.1, meaning 90% accuracy).
+
+    Returns:
+        True if CER < threshold (basically correct).
+    """
+    cer = compute_cer(pred, gt)
+    return cer < threshold
 
 
 # =============================================================================
@@ -97,7 +193,9 @@ class SampleResult:
     pred_a: str  # Agent A prediction
     pred_final: str  # Final prediction (after Agent B if routed)
     is_routed: bool  # Whether routed to Agent B
-    is_correct: bool  # Whether final prediction matches GT
+    is_correct: bool  # Whether final prediction is correct (CER-based)
+    cer_a: float = 0.0  # CER for Agent A
+    cer_final: float = 0.0  # CER for final prediction
     error: str = ""  # Error message if any
 
 
@@ -106,10 +204,12 @@ class PaperMetrics:
     """Core metrics for paper."""
 
     total_samples: int = 0
-    baseline_accuracy: float = 0.0  # Agent A only
-    l2w1_accuracy: float = 0.0  # Our method
+    baseline_accuracy: float = 0.0  # Agent A only (CER-based)
+    l2w1_accuracy: float = 0.0  # Our method (CER-based)
     router_activation_rate: float = 0.0  # Efficiency metric
     correction_success_rate: float = 0.0  # Agent B efficacy
+    avg_cer_baseline: float = 0.0  # Average CER for baseline
+    avg_cer_l2w1: float = 0.0  # Average CER for L2W1
 
 
 # =============================================================================
@@ -261,6 +361,20 @@ class L2W1Pipeline:
         if context_right is None:
             context_right = ""
 
+        # Determine if we should skip detection based on image size
+        # For real-world long text images, force detection mode (skip_detection=False)
+        skip_detection = self.skip_detection  # Start with pipeline setting
+        if image is not None:
+            w, h = image.size
+            # Force detection for wide images (width > 64) or non-square images
+            aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 1.0
+            if w > 64 or aspect_ratio > 1.5:
+                skip_detection = False  # Enable detection (don't skip)
+                logger.debug(
+                    f"Auto-enabling detection for image {w}x{h} "
+                    f"(aspect_ratio={aspect_ratio:.2f})"
+                )
+
         result = SampleResult(
             id=sample_id,
             gt=gt,
@@ -268,28 +382,43 @@ class L2W1Pipeline:
             pred_final=pred_a,  # Default to Agent A
             is_routed=False,
             is_correct=False,
+            cer_a=0.0,
+            cer_final=0.0,
         )
 
         try:
-            # If no OCR prediction, run Agent A (supports rec-only mode)
+            # If no OCR prediction, run Agent A
             if (
                 (pred_a is None or pred_a == "")
                 and self.agent_a is not None
                 and image is not None
             ):
                 try:
+                    # Use detection mode for real-world images
                     line_results = self.agent_a.inference(
                         image,
-                        skip_detection=self.skip_detection,
+                        skip_detection=skip_detection,
                     )
                     if line_results:
-                        # Use first line result for single-character images
-                        first_line = line_results[0]
-                        pred_a = first_line.get("text", pred_a)
-                        entropy = first_line.get("max_entropy", entropy)
+                        # For detection mode, concatenate all detected text lines
+                        if not skip_detection:
+                            # Detection mode: multiple lines
+                            pred_a = "".join([line.get("text", "") for line in line_results])
+                            # Use max entropy across all lines
+                            entropy = max(
+                                [line.get("max_entropy", 0.0) for line in line_results],
+                                default=0.0,
+                            )
+                        else:
+                            # Recognition-only mode: single line
+                            first_line = line_results[0]
+                            pred_a = first_line.get("text", pred_a)
+                            entropy = first_line.get("max_entropy", entropy)
+
                         # Update in result
                         result.pred_a = pred_a
                         result.pred_final = pred_a
+
                         # Recompute ppl based on new text
                         if self.router is not None and pred_a:
                             try:
@@ -298,6 +427,9 @@ class L2W1Pipeline:
                                 pass
                 except Exception as e:
                     result.error = f"Agent A error: {e}"
+
+            # Compute CER for Agent A
+            result.cer_a = compute_cer(result.pred_a, gt)
 
             # Routing decision
             is_routed = self.should_route(entropy, ppl)
@@ -316,8 +448,11 @@ class L2W1Pipeline:
                 except Exception as e:
                     result.error = f"Agent B error: {e}"
 
-            # Check correctness
-            result.is_correct = result.pred_final == gt
+            # Compute CER for final prediction
+            result.cer_final = compute_cer(result.pred_final, gt)
+
+            # Check correctness based on CER threshold
+            result.is_correct = is_correct_by_cer(result.pred_final, gt, CER_THRESHOLD)
 
         except Exception as e:
             result.error = str(e)
@@ -331,13 +466,13 @@ class L2W1Pipeline:
 
 
 def compute_paper_metrics(results: List[SampleResult]) -> PaperMetrics:
-    """Compute the 5 core metrics for paper.
+    """Compute the 5 core metrics for paper using CER.
 
     Args:
         results: List of sample results.
 
     Returns:
-        PaperMetrics with all 5 metrics.
+        PaperMetrics with all metrics.
     """
     metrics = PaperMetrics()
 
@@ -347,11 +482,11 @@ def compute_paper_metrics(results: List[SampleResult]) -> PaperMetrics:
 
     metrics.total_samples = n
 
-    # 1. Baseline Accuracy (Agent A only)
-    agent_a_correct = sum(1 for r in results if r.pred_a == r.gt)
+    # 1. Baseline Accuracy (Agent A only) - CER-based
+    agent_a_correct = sum(1 for r in results if is_correct_by_cer(r.pred_a, r.gt))
     metrics.baseline_accuracy = agent_a_correct / n
 
-    # 2. L2W1 Accuracy (Ours - final prediction)
+    # 2. L2W1 Accuracy (Ours - final prediction) - CER-based
     final_correct = sum(1 for r in results if r.is_correct)
     metrics.l2w1_accuracy = final_correct / n
 
@@ -361,10 +496,18 @@ def compute_paper_metrics(results: List[SampleResult]) -> PaperMetrics:
 
     # 4. Correction Success Rate
     # = (Agent A wrong AND final correct) / (Agent A wrong AND routed)
-    routed_and_a_wrong = [r for r in results if r.is_routed and r.pred_a != r.gt]
+    routed_and_a_wrong = [
+        r
+        for r in results
+        if r.is_routed and not is_correct_by_cer(r.pred_a, r.gt)
+    ]
     if len(routed_and_a_wrong) > 0:
         fixed = sum(1 for r in routed_and_a_wrong if r.is_correct)
         metrics.correction_success_rate = fixed / len(routed_and_a_wrong)
+
+    # 5. Average CER
+    metrics.avg_cer_baseline = sum(r.cer_a for r in results) / n
+    metrics.avg_cer_l2w1 = sum(r.cer_final for r in results) / n
 
     return metrics
 
@@ -388,6 +531,8 @@ def save_csv(results: List[SampleResult], output_path: Path) -> None:
                 "pred_final",
                 "is_routed",
                 "is_correct",
+                "cer_a",
+                "cer_final",
                 "error",
             ],
         )
@@ -404,7 +549,7 @@ def print_markdown_table(metrics: PaperMetrics) -> None:
 
     print()
     print("=" * 70)
-    print("  📊 PAPER METRICS TABLE (Copy to Paper)")
+    print("  📊 PAPER METRICS TABLE (CER-Based Evaluation)")
     print("=" * 70)
     print()
     print("| Metric | Value |")
@@ -416,7 +561,11 @@ def print_markdown_table(metrics: PaperMetrics) -> None:
     print(f"| **L2W1 Accuracy (Ours)** | **{metrics.l2w1_accuracy * 100:.2f}%** |")
     print(f"| Accuracy Improvement | +{improvement:.2f}% |")
     print(f"| Router Activation Rate | {metrics.router_activation_rate * 100:.2f}% |")
-    print(f"| Correction Success Rate | {metrics.correction_success_rate * 100:.2f}% |")
+    print(
+        f"| Correction Success Rate | {metrics.correction_success_rate * 100:.2f}% |"
+    )
+    print(f"| Avg CER (Baseline) | {metrics.avg_cer_baseline:.4f} |")
+    print(f"| Avg CER (L2W1) | {metrics.avg_cer_l2w1:.4f} |")
     print()
     print("=" * 70)
     print()
@@ -426,7 +575,7 @@ def print_markdown_table(metrics: PaperMetrics) -> None:
     print("-" * 70)
     print(r"\begin{table}[h]")
     print(r"\centering")
-    print(r"\caption{L2W1 Evaluation Results}")
+    print(r"\caption{L2W1 Evaluation Results (CER-Based)}")
     print(r"\begin{tabular}{lc}")
     print(r"\toprule")
     print(r"Metric & Value \\")
@@ -445,6 +594,8 @@ def print_markdown_table(metrics: PaperMetrics) -> None:
     print(
         f"Correction Success Rate & {metrics.correction_success_rate * 100:.2f}\\% \\\\"
     )
+    print(f"Avg CER (Baseline) & {metrics.avg_cer_baseline:.4f} \\\\")
+    print(f"Avg CER (L2W1) & {metrics.avg_cer_l2w1:.4f} \\\\")
     print(r"\bottomrule")
     print(r"\end{tabular}")
     print(r"\end{table}")
@@ -459,7 +610,7 @@ def print_markdown_table(metrics: PaperMetrics) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="L2W1 Batch Inference for Paper Experiments",
+        description="L2W1 Batch Inference for Paper Experiments (CER-Based)",
     )
     parser.add_argument(
         "--test_set",
@@ -495,17 +646,28 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Limit samples (for debugging)",
     )
+    parser.add_argument(
+        "--cer_threshold",
+        type=float,
+        default=CER_THRESHOLD,
+        help=f"CER threshold for correctness (default: {CER_THRESHOLD})",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
+    # Update global CER threshold if provided
+    global CER_THRESHOLD
+    CER_THRESHOLD = args.cer_threshold
+
     print()
     print("=" * 70)
-    print("  L2W1 Batch Inference - Paper Experiments")
+    print("  L2W1 Batch Inference - Paper Experiments (CER-Based)")
     print("=" * 70)
     print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  CER Threshold: {CER_THRESHOLD} (CER < {CER_THRESHOLD} = correct)")
     print()
 
     # Find test set
@@ -543,11 +705,16 @@ def main() -> None:
     print("-" * 70)
 
     # Enable rec_only automatically for CASIA single-character set
+    # For real-world data (viscgec, real_handwritten), force detection mode
     auto_rec_only = "casia" in test_set_path.name.lower()
     rec_only_flag = args.rec_only or auto_rec_only
 
     if auto_rec_only and not args.rec_only:
         logger.info("Auto-enabling rec_only mode for CASIA test set (skip detection).")
+    elif not auto_rec_only:
+        logger.info(
+            "Real-world dataset detected. Detection mode will be auto-enabled for wide images."
+        )
 
     pipeline = L2W1Pipeline(
         ppl_threshold=args.ppl_threshold,
@@ -601,6 +768,8 @@ def main() -> None:
                     pred_final=sample.get("ocr_pred", ""),
                     is_routed=False,
                     is_correct=False,
+                    cer_a=1.0,
+                    cer_final=1.0,
                     error=str(e),
                 )
             )
