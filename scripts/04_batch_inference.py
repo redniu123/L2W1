@@ -20,6 +20,15 @@ Usage:
     python scripts/04_batch_inference.py --test_set data/test_set.json
 """
 
+import os
+
+# --- 【添加这两行】强制指定模型路径 & 离线模式 ---
+# 1. 指定你解压出来的 my_models 文件夹的绝对路径
+os.environ["HF_HOME"] = "/home/coder/project/L2W1/my_models"
+
+# 2. 告诉 Hugging Face 不要联网，直接用本地的
+os.environ["HF_HUB_OFFLINE"] = "1"
+# ------------------------------------------------
 # =============================================================================
 # Path Patching
 # =============================================================================
@@ -46,6 +55,7 @@ from PIL import Image
 
 try:
     from tqdm import tqdm
+
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
@@ -77,9 +87,11 @@ logger = logging.getLogger(__name__)
 # Data Structures
 # =============================================================================
 
+
 @dataclass
 class SampleResult:
     """Result for a single sample."""
+
     id: str
     gt: str  # Ground truth
     pred_a: str  # Agent A prediction
@@ -89,9 +101,10 @@ class SampleResult:
     error: str = ""  # Error message if any
 
 
-@dataclass 
+@dataclass
 class PaperMetrics:
     """Core metrics for paper."""
+
     total_samples: int = 0
     baseline_accuracy: float = 0.0  # Agent A only
     l2w1_accuracy: float = 0.0  # Our method
@@ -103,15 +116,16 @@ class PaperMetrics:
 # Data Loading
 # =============================================================================
 
+
 def load_test_set(test_set_path: Path) -> List[Dict[str, Any]]:
     """Load test set from JSON file.
-    
+
     Args:
         test_set_path: Path to JSON file.
-        
+
     Returns:
         List of sample dictionaries.
-        
+
     Raises:
         FileNotFoundError: If file doesn't exist.
     """
@@ -120,10 +134,10 @@ def load_test_set(test_set_path: Path) -> List[Dict[str, Any]]:
             f"Test set not found: {test_set_path}\n"
             f"Please create the test set file or use --test_set to specify a different path."
         )
-    
+
     with open(test_set_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    
+
     # Handle both formats: list or {"samples": [...]}
     if isinstance(data, list):
         samples = data
@@ -131,7 +145,7 @@ def load_test_set(test_set_path: Path) -> List[Dict[str, Any]]:
         samples = data.get("samples", [])
     else:
         raise ValueError(f"Unexpected data format: {type(data)}")
-    
+
     logger.info(f"Loaded {len(samples)} samples from {test_set_path.name}")
     return samples
 
@@ -146,7 +160,7 @@ def resolve_image_path(image_path_str: str, base_dir: Path) -> Optional[Path]:
         PROJECT_ROOT / image_path_str,
         Path(image_path_str),
     ]
-    
+
     for path in candidates:
         if path.exists():
             return path
@@ -157,9 +171,10 @@ def resolve_image_path(image_path_str: str, base_dir: Path) -> Optional[Path]:
 # L2W1 Pipeline
 # =============================================================================
 
+
 class L2W1Pipeline:
     """Unified L2W1 Pipeline for batch inference."""
-    
+
     def __init__(
         self,
         ppl_threshold: float = PPL_THRESHOLD,
@@ -173,33 +188,36 @@ class L2W1Pipeline:
         self.agent_a = None
         self.router = None
         self.agent_b = None
-        
+
         self._init_agents(use_gpu)
-    
+
     def _init_agents(self, use_gpu: bool) -> None:
         """Initialize all agents."""
         # Agent A
         logger.info("Loading Agent A (PaddleOCR)...")
         try:
             from core.agent_a import AgentA
+
             self.agent_a = AgentA(use_gpu=use_gpu)
             logger.info("  ✓ Agent A ready")
         except Exception as e:
             logger.warning(f"  ✗ Agent A failed: {e}")
-        
+
         # Router
         logger.info("Loading Router (Qwen2.5-0.5B)...")
         try:
             from core.router import Router
+
             self.router = Router()
             logger.info("  ✓ Router ready")
         except Exception as e:
             logger.warning(f"  ✗ Router failed: {e}")
-        
+
         # Agent B
         logger.info("Loading Agent B (Qwen2-VL-2B)...")
         try:
             from core.agent_b import AgentB
+
             self.agent_b = AgentB(
                 model_path="Qwen/Qwen2-VL-2B-Instruct",
                 load_in_4bit=True,
@@ -207,22 +225,22 @@ class L2W1Pipeline:
             logger.info("  ✓ Agent B ready")
         except Exception as e:
             logger.warning(f"  ✗ Agent B failed: {e}")
-    
+
     def should_route(self, entropy: float, ppl: float) -> bool:
         """Determine if sample should be routed to Agent B."""
         return ppl > self.ppl_threshold or entropy > self.entropy_threshold
-    
+
     def infer(
         self,
         sample: Dict[str, Any],
         image: Optional[Image.Image] = None,
     ) -> SampleResult:
         """Run inference on a single sample.
-        
+
         Args:
             sample: Sample dict with keys: id, label_gt, ocr_pred, context, etc.
             image: Pre-loaded PIL Image (optional).
-            
+
         Returns:
             SampleResult with predictions and routing info.
         """
@@ -231,7 +249,7 @@ class L2W1Pipeline:
         pred_a = sample.get("ocr_pred", "")
         entropy = sample.get("ocr_entropy", 0.0)
         ppl = sample.get("ppl_score", 0.0)
-        
+
         # Handle context - default to empty string if missing
         context = sample.get("context", "")
         if context is None:
@@ -242,7 +260,7 @@ class L2W1Pipeline:
             context_left = ""
         if context_right is None:
             context_right = ""
-        
+
         result = SampleResult(
             id=sample_id,
             gt=gt,
@@ -254,7 +272,11 @@ class L2W1Pipeline:
 
         try:
             # If no OCR prediction, run Agent A (supports rec-only mode)
-            if (pred_a is None or pred_a == "") and self.agent_a is not None and image is not None:
+            if (
+                (pred_a is None or pred_a == "")
+                and self.agent_a is not None
+                and image is not None
+            ):
                 try:
                     line_results = self.agent_a.inference(
                         image,
@@ -295,11 +317,11 @@ class L2W1Pipeline:
                     result.error = f"Agent B error: {e}"
 
             # Check correctness
-            result.is_correct = (result.pred_final == gt)
+            result.is_correct = result.pred_final == gt
 
         except Exception as e:
             result.error = str(e)
-        
+
         return result
 
 
@@ -307,42 +329,43 @@ class L2W1Pipeline:
 # Metrics Calculation
 # =============================================================================
 
+
 def compute_paper_metrics(results: List[SampleResult]) -> PaperMetrics:
     """Compute the 5 core metrics for paper.
-    
+
     Args:
         results: List of sample results.
-        
+
     Returns:
         PaperMetrics with all 5 metrics.
     """
     metrics = PaperMetrics()
-    
+
     n = len(results)
     if n == 0:
         return metrics
-    
+
     metrics.total_samples = n
-    
+
     # 1. Baseline Accuracy (Agent A only)
     agent_a_correct = sum(1 for r in results if r.pred_a == r.gt)
     metrics.baseline_accuracy = agent_a_correct / n
-    
+
     # 2. L2W1 Accuracy (Ours - final prediction)
     final_correct = sum(1 for r in results if r.is_correct)
     metrics.l2w1_accuracy = final_correct / n
-    
+
     # 3. Router Activation Rate
     routed = sum(1 for r in results if r.is_routed)
     metrics.router_activation_rate = routed / n
-    
+
     # 4. Correction Success Rate
     # = (Agent A wrong AND final correct) / (Agent A wrong AND routed)
     routed_and_a_wrong = [r for r in results if r.is_routed and r.pred_a != r.gt]
     if len(routed_and_a_wrong) > 0:
         fixed = sum(1 for r in routed_and_a_wrong if r.is_correct)
         metrics.correction_success_rate = fixed / len(routed_and_a_wrong)
-    
+
     return metrics
 
 
@@ -350,26 +373,35 @@ def compute_paper_metrics(results: List[SampleResult]) -> PaperMetrics:
 # Output Functions
 # =============================================================================
 
+
 def save_csv(results: List[SampleResult], output_path: Path) -> None:
     """Save results to CSV file."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["id", "gt", "pred_a", "pred_final", "is_routed", "is_correct", "error"],
+            fieldnames=[
+                "id",
+                "gt",
+                "pred_a",
+                "pred_final",
+                "is_routed",
+                "is_correct",
+                "error",
+            ],
         )
         writer.writeheader()
         for r in results:
             writer.writerow(asdict(r))
-    
+
     logger.info(f"CSV saved: {output_path}")
 
 
 def print_markdown_table(metrics: PaperMetrics) -> None:
     """Print metrics as Markdown table for paper."""
     improvement = (metrics.l2w1_accuracy - metrics.baseline_accuracy) * 100
-    
+
     print()
     print("=" * 70)
     print("  📊 PAPER METRICS TABLE (Copy to Paper)")
@@ -378,7 +410,9 @@ def print_markdown_table(metrics: PaperMetrics) -> None:
     print("| Metric | Value |")
     print("|--------|-------|")
     print(f"| Total Samples | {metrics.total_samples} |")
-    print(f"| Baseline Accuracy (Agent A only) | {metrics.baseline_accuracy * 100:.2f}% |")
+    print(
+        f"| Baseline Accuracy (Agent A only) | {metrics.baseline_accuracy * 100:.2f}% |"
+    )
     print(f"| **L2W1 Accuracy (Ours)** | **{metrics.l2w1_accuracy * 100:.2f}%** |")
     print(f"| Accuracy Improvement | +{improvement:.2f}% |")
     print(f"| Router Activation Rate | {metrics.router_activation_rate * 100:.2f}% |")
@@ -386,7 +420,7 @@ def print_markdown_table(metrics: PaperMetrics) -> None:
     print()
     print("=" * 70)
     print()
-    
+
     # Also print LaTeX format
     print("  📄 LaTeX Table Format:")
     print("-" * 70)
@@ -398,11 +432,19 @@ def print_markdown_table(metrics: PaperMetrics) -> None:
     print(r"Metric & Value \\")
     print(r"\midrule")
     print(f"Total Samples & {metrics.total_samples} \\\\")
-    print(f"Baseline Accuracy (Agent A) & {metrics.baseline_accuracy * 100:.2f}\\% \\\\")
-    print(f"\\textbf{{L2W1 Accuracy (Ours)}} & \\textbf{{{metrics.l2w1_accuracy * 100:.2f}\\%}} \\\\")
+    print(
+        f"Baseline Accuracy (Agent A) & {metrics.baseline_accuracy * 100:.2f}\\% \\\\"
+    )
+    print(
+        f"\\textbf{{L2W1 Accuracy (Ours)}} & \\textbf{{{metrics.l2w1_accuracy * 100:.2f}\\%}} \\\\"
+    )
     print(f"Improvement & +{improvement:.2f}\\% \\\\")
-    print(f"Router Activation Rate & {metrics.router_activation_rate * 100:.2f}\\% \\\\")
-    print(f"Correction Success Rate & {metrics.correction_success_rate * 100:.2f}\\% \\\\")
+    print(
+        f"Router Activation Rate & {metrics.router_activation_rate * 100:.2f}\\% \\\\"
+    )
+    print(
+        f"Correction Success Rate & {metrics.correction_success_rate * 100:.2f}\\% \\\\"
+    )
     print(r"\bottomrule")
     print(r"\end{tabular}")
     print(r"\end{table}")
@@ -413,6 +455,7 @@ def print_markdown_table(metrics: PaperMetrics) -> None:
 # =============================================================================
 # Main
 # =============================================================================
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -457,14 +500,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    
+
     print()
     print("=" * 70)
     print("  L2W1 Batch Inference - Paper Experiments")
     print("=" * 70)
     print(f"  Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
-    
+
     # Find test set
     test_set_path = args.test_set
     if test_set_path is None:
@@ -477,26 +520,28 @@ def main() -> None:
             logger.error(f"Test set not found!")
             logger.error(f"  Expected: {DEFAULT_TEST_SET}")
             logger.error(f"  Fallback: {FALLBACK_TEST_SET}")
-            logger.error(f"Please create the test set or use --test_set to specify a path.")
+            logger.error(
+                f"Please create the test set or use --test_set to specify a path."
+            )
             return
-    
+
     # Load test set
     try:
         samples = load_test_set(test_set_path)
     except FileNotFoundError as e:
         logger.error(str(e))
         return
-    
+
     if args.limit:
-        samples = samples[:args.limit]
+        samples = samples[: args.limit]
         logger.info(f"Limited to {len(samples)} samples")
-    
+
     # Initialize pipeline
     print()
     print("-" * 70)
     print("  Initializing Pipeline...")
     print("-" * 70)
-    
+
     # Enable rec_only automatically for CASIA single-character set
     auto_rec_only = "casia" in test_set_path.name.lower()
     rec_only_flag = args.rec_only or auto_rec_only
@@ -509,20 +554,22 @@ def main() -> None:
         use_gpu=not args.cpu,
         skip_detection=rec_only_flag,
     )
-    
+
     # Run inference
     print()
     print("-" * 70)
     print("  Running Batch Inference...")
     print("-" * 70)
     print()
-    
+
     results: List[SampleResult] = []
-    
-    iterator = tqdm(samples, desc="Processing", unit="sample") if TQDM_AVAILABLE else samples
+
+    iterator = (
+        tqdm(samples, desc="Processing", unit="sample") if TQDM_AVAILABLE else samples
+    )
     if not TQDM_AVAILABLE:
         logger.info(f"Processing {len(samples)} samples...")
-    
+
     for sample in iterator:
         try:
             # Load image
@@ -530,7 +577,7 @@ def main() -> None:
                 sample.get("image_path", ""),
                 test_set_path.parent,
             )
-            
+
             image = None
             if image_path and image_path.exists():
                 try:
@@ -539,43 +586,45 @@ def main() -> None:
                         image = image.convert("RGB")
                 except Exception as e:
                     logger.warning(f"Failed to load {image_path}: {e}")
-            
+
             # Run inference
             result = pipeline.infer(sample, image)
             results.append(result)
-            
+
         except Exception as e:
             logger.error(f"Error on {sample.get('id', '?')}: {e}")
-            results.append(SampleResult(
-                id=sample.get("id", "unknown"),
-                gt=sample.get("label_gt", ""),
-                pred_a=sample.get("ocr_pred", ""),
-                pred_final=sample.get("ocr_pred", ""),
-                is_routed=False,
-                is_correct=False,
-                error=str(e),
-            ))
-    
+            results.append(
+                SampleResult(
+                    id=sample.get("id", "unknown"),
+                    gt=sample.get("label_gt", ""),
+                    pred_a=sample.get("ocr_pred", ""),
+                    pred_final=sample.get("ocr_pred", ""),
+                    is_routed=False,
+                    is_correct=False,
+                    error=str(e),
+                )
+            )
+
     # Compute metrics
     metrics = compute_paper_metrics(results)
-    
+
     # Save CSV
     save_csv(results, args.output_csv)
-    
+
     # Print Markdown table
     print_markdown_table(metrics)
-    
+
     # Summary
     print("  📁 Output Files:")
     print(f"     CSV: {args.output_csv}")
     print()
-    
+
     # Cleanup
     logger.info("Cleaning up GPU memory...")
     del pipeline
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
+
     print("=" * 70)
     print("  ✓ Evaluation Complete")
     print("=" * 70)
