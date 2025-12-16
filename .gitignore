@@ -3,6 +3,7 @@ docs/
 l2w1/
 fonts/
 my_models/
+VisCGEC/
 
 # Python 相关
 __pycache__/
