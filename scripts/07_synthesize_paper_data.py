@@ -86,28 +86,43 @@ def _scan_single_char_images(input_dir: Path) -> List[Tuple[Path, str]]:
         List of (image_path, label) tuples. Images with unparseable labels are skipped.
     """
     def _extract_label_from_filename(filename: str) -> Optional[str]:
-        """Extract single-character label from filename.
-
-        Priority:
-        1) Split by "_" and, if the first segment has length 1 (any character),
-           return it directly as the label.
-        2) Otherwise, take the first character of the stem.
-
-        This is intentionally more permissive than the main builder script,
-        because the synthetic benchmark can include non-Chinese symbols.
-
+        """Extract label from filename (Universal Support).
+        
+        Logic:
+        1. Split filename by underscore '_'.
+        2. The first part is ALWAYS the label, regardless of language.
+        
+        Examples:
+        - 测_123.jpg -> "测"
+        - h_00001.jpg -> "h"
+        - ~_00201.jpg -> "~"
+        
         Args:
             filename: Image filename (without path).
-
+        
         Returns:
             Extracted single-character label, or None if not found.
         """
-        stem: str = Path(filename).stem
-        parts: List[str] = stem.split("_")
-        if parts and len(parts[0]) == 1:
-            return parts[0]
-        if stem:
-            return stem[0]
+        import os
+        import re
+        # Remove extension
+        name = os.path.splitext(os.path.basename(filename))[0]
+        
+        # Strategy: Split by underscore
+        # This assumes format "Label_ID.jpg" or "Label_Anything.jpg"
+        parts = name.split('_')
+        
+        if len(parts) >= 1:
+            candidate = parts[0]
+            # Valid label check: strictly length 1 (single char)
+            if len(candidate) == 1:
+                return candidate
+                
+        # Fallback (Legacy): Regex for Chinese if underscore logic fails
+        chinese_match = re.search(r'[\u4e00-\u9fff]', name)
+        if chinese_match:
+            return chinese_match.group(0)
+            
         return None
 
     if not input_dir.exists():
@@ -668,17 +683,37 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 def extract_label_from_filename(filename: str) -> Optional[str]:
-    """Extract Chinese character label from filename.
-
-    Expected formats:
-        - 测_123.jpg -> 测
-        - 测.png -> 测
+    """Extract label from filename (Universal Support).
+    
+    Logic:
+    1. Split filename by underscore '_'.
+    2. The first part is ALWAYS the label, regardless of language.
+    
+    Examples:
+    - 测_123.jpg -> "测"
+    - h_00001.jpg -> "h"
+    - ~_00201.jpg -> "~"
     """
-    stem = Path(filename).stem
-    # Take first non-ASCII char as label (simple heuristic)
-    for ch in stem:
-        if ord(ch) > 127:
-            return ch
+    import os
+    import re
+    # Remove extension
+    name = os.path.splitext(os.path.basename(filename))[0]
+    
+    # Strategy: Split by underscore
+    # This assumes format "Label_ID.jpg" or "Label_Anything.jpg"
+    parts = name.split('_')
+    
+    if len(parts) >= 1:
+        candidate = parts[0]
+        # Valid label check: strictly length 1 (single char)
+        if len(candidate) == 1:
+            return candidate
+            
+    # Fallback (Legacy): Regex for Chinese if underscore logic fails
+    chinese_match = re.search(r'[\u4e00-\u9fff]', name)
+    if chinese_match:
+        return chinese_match.group(0)
+        
     return None
 
 

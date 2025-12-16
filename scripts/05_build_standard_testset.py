@@ -61,56 +61,41 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 def extract_label_from_filename(filename: str) -> Optional[str]:
-    """Extract single-character label from filename.
-
-    Priority:
-    1) Split by "_" and, if the first segment has length 1 (any character),
-       return it directly as the label.
-    2) Otherwise, fall back to finding the first Chinese character.
-    3) Finally, try to decode a 4-hex-digit Unicode code point at the
-       beginning of the filename.
-
-    Expected formats (examples):
-    - 测_123.jpg      -> 测
-    - 测.jpg          -> 测
-    - char_测_001.png -> 测
-    - 测试_1.jpg       -> 测 (first Chinese character)
-    - A_001.png       -> A
-    - ~_00201.jpg     -> ~
-
+    """Extract label from filename (Universal Support).
+    
+    Logic:
+    1. Split filename by underscore '_'.
+    2. The first part is ALWAYS the label, regardless of language.
+    
+    Examples:
+    - 测_123.jpg -> "测"
+    - h_00001.jpg -> "h"
+    - ~_00201.jpg -> "~"
+    
     Args:
         filename: Image filename (without path).
-
+    
     Returns:
         Extracted single-character label, or None if not found.
     """
     # Remove extension
-    name: str = Path(filename).stem
-
-    # Strategy 1: Split by "_" and use single-character prefix directly
-    # e.g., "~_00201", "A_001", "测_123"
-    parts: List[str] = name.split("_")
-    if parts and len(parts[0]) == 1:
-        return parts[0]
-
-    # Strategy 2: Find first Chinese character anywhere in the name
-    matches: List[str] = CHINESE_CHAR_PATTERN.findall(name)
-    if matches:
-        return matches[0]  # Return first Chinese character
-
-    # Strategy 3: Try to decode from potential Unicode code point
-    # CASIA sometimes uses hex codes like "6d4b" for "测"
-    hex_pattern = re.compile(r"^([0-9a-fA-F]{4})(?:_|$)")
-    hex_match = hex_pattern.match(name)
-    if hex_match:
-        try:
-            char = chr(int(hex_match.group(1), 16))
-            if CHINESE_CHAR_PATTERN.match(char):
-                return char
-        except (ValueError, OverflowError):
-            # Fail silently here and let the caller handle None
-            pass
-
+    name = os.path.splitext(os.path.basename(filename))[0]
+    
+    # Strategy: Split by underscore
+    # This assumes format "Label_ID.jpg" or "Label_Anything.jpg"
+    parts = name.split('_')
+    
+    if len(parts) >= 1:
+        candidate = parts[0]
+        # Valid label check: strictly length 1 (single char)
+        if len(candidate) == 1:
+            return candidate
+            
+    # Fallback (Legacy): Regex for Chinese if underscore logic fails
+    chinese_match = CHINESE_CHAR_PATTERN.search(name)
+    if chinese_match:
+        return chinese_match.group(0)
+        
     return None
 
 
