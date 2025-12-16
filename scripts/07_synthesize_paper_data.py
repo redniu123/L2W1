@@ -254,7 +254,7 @@ def concatenate_horizontally(images: Sequence[Image.Image]) -> Image.Image:
 
 
 def apply_gaussian_blur(img: Image.Image) -> Image.Image:
-    """Apply Gaussian blur with random small kernel.
+    """Apply Gaussian blur with small kernel.
 
     Kernel size is approximated by radius in PIL:
     - 3x3 -> radius ~1
@@ -266,11 +266,11 @@ def apply_gaussian_blur(img: Image.Image) -> Image.Image:
     Returns:
         Blurred image.
     """
-    radius: int = random.choice([1, 2])
+    radius: int = 1  # Fixed to 3x3 kernel for reduced noise
     return img.filter(ImageFilter.GaussianBlur(radius=radius))
 
 
-def apply_salt_pepper_noise(img: Image.Image, amount: float = 0.02) -> Image.Image:
+def apply_salt_pepper_noise(img: Image.Image, amount: float = 0.01) -> Image.Image:
     """Apply salt-and-pepper noise to a grayscale image.
 
     This operates on the `[H, W]` array and randomly sets a proportion of
@@ -314,7 +314,7 @@ def apply_low_contrast(img: Image.Image) -> Image.Image:
         Contrast-reduced image.
     """
     enhancer = ImageEnhance.Contrast(img)
-    factor: float = random.uniform(0.3, 0.7)
+    factor: float = random.uniform(0.6, 0.9)  # Keep at least 0.6 contrast
     return enhancer.enhance(factor)
 
 
@@ -407,6 +407,12 @@ def synthesize_samples(
             rel_path = save_path.relative_to(PROJECT_ROOT)
         except ValueError:
             rel_path = save_path
+
+        logger.info(
+            "[Synthesize] Generated %s with label '%s'",
+            image_filename,
+            text,
+        )
 
         sample: Dict[str, Any] = {
             "id": f"synthetic_{idx:05d}",
@@ -714,7 +720,7 @@ def load_char_images(input_dir: Path) -> List[Tuple[np.ndarray, str]]:
 
 def normalize_height(
     images: List[Tuple[np.ndarray, str]],
-    target_height: int = 64,
+    target_height: int = 48,
 ) -> List[Tuple[np.ndarray, str]]:
     """Normalize all character images to same height while preserving aspect."""
     norm: List[Tuple[np.ndarray, str]] = []
@@ -744,7 +750,7 @@ def synthesize_line(
     chosen = random.choices(pool, k=num_chars)
 
     # Normalize height
-    chosen = normalize_height(chosen, target_height=64)
+    chosen = normalize_height(chosen, target_height=48)
     if not chosen:
         raise ValueError("Failed to normalize characters.")
 
@@ -777,7 +783,7 @@ def synthesize_line(
 # =============================================================================
 
 def add_gaussian_blur(image: np.ndarray) -> np.ndarray:
-    ksize = random.choice([3, 5])
+    ksize = 3  # Fixed to 3x3 kernel for reduced noise
     sigma = random.uniform(0.5, 1.5)
     return cv2.GaussianBlur(image, (ksize, ksize), sigmaX=sigma)
 
@@ -873,6 +879,12 @@ def generate_benchmark(
         filename = f"{sample_id}.png"
         img_path = OUTPUT_DIR / filename
         cv2.imwrite(str(img_path), img)
+
+        logger.info(
+            "[Synthesize] Generated %s with label '%s'",
+            filename,
+            text,
+        )
 
         rel_path = img_path.relative_to(PROJECT_ROOT)
         samples.append(
