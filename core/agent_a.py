@@ -676,6 +676,112 @@ class AgentA:
             "needs_agent_b": needs_agent_b,
         }
 
+    def _split_line_by_projection(
+        self,
+        image_crop: np.ndarray,
+        n_chars: int,
+    ) -> List[int]:
+        """Split text line image into character boundaries using vertical projection.
+
+        This method uses vertical projection profile to find character boundaries
+        (valleys between characters) instead of uniform width distribution.
+
+        Args:
+            image_crop: Cropped text line image as numpy array [H, W, C] or [H, W].
+            n_chars: Expected number of characters.
+
+        Returns:
+            List of x-coordinates for character boundaries (including start and end).
+            Format: [x_start, x_boundary1, x_boundary2, ..., x_end]
+            Should have length = n_chars + 1.
+        """
+        # Convert to grayscale if needed
+        if len(image_crop.shape) == 3:
+            gray = cv2.cvtColor(image_crop, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image_crop.copy()
+
+        h, w = gray.shape
+
+        # Binarize using Otsu's threshold
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # Compute vertical projection profile
+        # Sum pixels along each column (vertical direction)
+        projection = np.sum(binary, axis=0)  # Shape: [W]
+
+        # Smooth the projection to reduce noise
+        # Use a small Gaussian filter if scipy is available, else use moving average
+        try:
+            from scipy import ndimage
+
+            projection_smooth = ndimage.gaussian_filter1d(projection.astype(float), sigma=1.0)
+        except ImportError:
+            # Fallback: simple moving average if scipy not available
+            kernel_size = 3
+            projection_smooth = np.convolve(
+                projection.astype(float),
+                np.ones(kernel_size) / kernel_size,
+                mode="same",
+            )
+
+        # Find valleys (local minima) in the projection
+        # A valley is a point where projection is lower than neighbors
+        valleys = []
+        # Adaptive threshold: use mean * 0.3, but ensure it's not too strict
+        mean_projection = np.mean(projection_smooth)
+        threshold = max(mean_projection * 0.3, mean_projection * 0.1)  # At least 10% of mean
+
+        # Find local minima with improved detection
+        for i in range(2, len(projection_smooth) - 2):
+            # Check if this is a local minimum (compare with neighbors)
+            is_local_min = (
+                projection_smooth[i] < projection_smooth[i - 1]
+                and projection_smooth[i] < projection_smooth[i + 1]
+            )
+            
+            # Also check wider neighborhood to avoid noise
+            is_deep_valley = (
+                projection_smooth[i] < projection_smooth[i - 2]
+                and projection_smooth[i] < projection_smooth[i + 2]
+            )
+            
+            # Must be below threshold and be a local minimum
+            if (is_local_min or is_deep_valley) and projection_smooth[i] < threshold:
+                valleys.append(i)
+
+        # We need n_chars - 1 boundaries (to split into n_chars segments)
+        expected_valleys = n_chars - 1
+
+        if len(valleys) == expected_valleys:
+            # Perfect match: use the valleys as boundaries
+            boundaries = [0] + sorted(valleys) + [w]
+            logger.debug(
+                f"Found {len(valleys)} valleys matching expected {expected_valleys} characters"
+            )
+            return boundaries
+        elif len(valleys) > expected_valleys:
+            # Too many valleys: select the most significant ones
+            # Sort by depth (how low the projection is)
+            valley_depths = [
+                (i, projection_smooth[i]) for i in valleys
+            ]
+            valley_depths.sort(key=lambda x: x[1])  # Sort by depth (ascending)
+            # Take the deepest n_chars - 1 valleys
+            selected_valleys = sorted([v[0] for v in valley_depths[:expected_valleys]])
+            boundaries = [0] + selected_valleys + [w]
+            logger.debug(
+                f"Selected {expected_valleys} deepest valleys from {len(valleys)} candidates"
+            )
+            return boundaries
+        else:
+            # Too few valleys: fallback to linear split
+            logger.warning(
+                f"Found {len(valleys)} valleys but expected {expected_valleys}. "
+                f"Falling back to linear split."
+            )
+            return None
+
     def inference_with_char_boxes(
         self,
         image: Union[np.ndarray, str],
@@ -684,11 +790,12 @@ class AgentA:
         """Run inference and return character-level bounding boxes.
 
         This method splits line-level boxes into character-level boxes
-        using uniform width distribution. Useful for visualization and
-        downstream processing.
+        using vertical projection profile to find accurate character boundaries.
+        Falls back to uniform width distribution if projection fails.
 
         Args:
             image: Input image as numpy array or file path.
+            skip_detection: Whether to skip detection (rec-only mode).
 
         Returns:
             List of character-level results:
@@ -701,7 +808,27 @@ class AgentA:
                 "char_index": 0
             }
         """
-        line_results = self.inference(image, skip_detection=skip_detection)
+        # Load image if needed
+        if isinstance(image, str):
+            img_array = cv2.imread(image)
+            if img_array is None:
+                logger.error(f"Failed to load image: {image}")
+                return []
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+        elif hasattr(image, "mode"):
+            from PIL import Image as PILImage
+            if isinstance(image, PILImage.Image):
+                img_array = np.array(image)
+                if len(img_array.shape) == 2:
+                    img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
+                elif img_array.shape[2] == 4:
+                    img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
+            else:
+                img_array = image
+        else:
+            img_array = image
+
+        line_results = self.inference(img_array, skip_detection=skip_detection)
         char_results: List[Dict[str, Any]] = []
 
         for line in line_results:
@@ -716,25 +843,60 @@ class AgentA:
             # Extract bounding box coordinates
             xs = [p[0] for p in box]
             ys = [p[1] for p in box]
-            x_min, x_max = min(xs), max(xs)
-            y_min, y_max = min(ys), max(ys)
+            x_min, x_max = int(min(xs)), int(max(xs))
+            y_min, y_max = int(min(ys)), int(max(ys))
 
-            # Distribute width uniformly among characters
-            char_width = (x_max - x_min) / len(text)
+            # Crop the text line region from original image
+            # Ensure coordinates are within image bounds
+            img_h, img_w = img_array.shape[:2]
+            x_min = max(0, x_min)
+            x_max = min(img_w, x_max)
+            y_min = max(0, y_min)
+            y_max = min(img_h, y_max)
 
-            for i, char in enumerate(text):
-                char_x1 = x_min + i * char_width
-                char_x2 = char_x1 + char_width
+            if x_max <= x_min or y_max <= y_min:
+                logger.warning(f"Invalid bounding box: ({x_min}, {y_min}, {x_max}, {y_max})")
+                continue
 
-                char_results.append(
-                    {
-                        "char": char,
-                        "box": [char_x1, y_min, char_x2, y_max],
-                        "score": scores[i],
-                        "entropy": entropies[i],
-                        "line_text": text,
-                        "char_index": i,
-                    }
-                )
+            line_crop = img_array[y_min:y_max, x_min:x_max]
+
+            # Try projection-based splitting
+            boundaries = self._split_line_by_projection(line_crop, len(text))
+
+            if boundaries is None or len(boundaries) != len(text) + 1:
+                # Fallback to linear split
+                logger.debug(f"Using linear split fallback for '{text}'")
+                char_width = (x_max - x_min) / len(text)
+                for i, char in enumerate(text):
+                    char_x1 = x_min + i * char_width
+                    char_x2 = char_x1 + char_width
+                    char_results.append(
+                        {
+                            "char": char,
+                            "box": [char_x1, y_min, char_x2, y_max],
+                            "score": scores[i],
+                            "entropy": entropies[i],
+                            "line_text": text,
+                            "char_index": i,
+                        }
+                    )
+            else:
+                # Use projection-based boundaries
+                logger.debug(f"Using projection-based split for '{text}' with {len(boundaries)-1} boundaries")
+                for i, char in enumerate(text):
+                    # Boundaries are relative to the crop, need to add x_min offset
+                    char_x1 = x_min + boundaries[i]
+                    char_x2 = x_min + boundaries[i + 1]
+
+                    char_results.append(
+                        {
+                            "char": char,
+                            "box": [char_x1, y_min, char_x2, y_max],
+                            "score": scores[i],
+                            "entropy": entropies[i],
+                            "line_text": text,
+                            "char_index": i,
+                        }
+                    )
 
         return char_results

@@ -62,7 +62,10 @@ class AgentB:
     """
     
     # System prompt for V-CoT (L2W1-MOD-005)
-    SYSTEM_PROMPT = "你是一个中文古籍/手写体识别专家。你的任务是根据图像和上下文，纠正 OCR 的错误识别。"
+    SYSTEM_PROMPT = """你是一个中文手写字识别专家。你需要纠正OCR的错误识别。
+请按照以下格式输出：
+【分析】观察字形结构、笔画细节，并结合上下文推断该字最可能是什么。
+【结果】输出最终确定的单个汉字。如果无法确定，输出 <UNKNOWN>。"""
     
     def __init__(
         self,
@@ -142,9 +145,9 @@ class AgentB:
         """Build Visual Chain-of-Thought (V-CoT) prompt.
         
         Implements L2W1-MOD-005 V-CoT Prompt Template:
-        - Forces explicit reasoning steps
+        - Forces explicit reasoning steps with 【分析】and 【结果】format
         - Embeds context and OCR prediction
-        - Instructs model to output only final character
+        - Enables explicit reasoning chain
         
         Args:
             context_left: Left context text.
@@ -154,42 +157,75 @@ class AgentB:
         Returns:
             Formatted user prompt string.
         """
-        # L2W1-MOD-005 User Prompt Template
-        prompt = f"""上下文：[{context_left}] <目标字符> [{context_right}]
+        # L2W1-MOD-005 User Prompt Template with explicit reasoning
+        prompt = f"""上下文：{context_left}[?]{context_right}
 OCR 认为这是：'{ocr_pred}'
 
-请执行以下步骤：
-1. 观察图像中的笔画结构和部首。
-2. 结合上下文判断语义是否通顺。
-3. 如果 OCR 正确，输出 "KEEP"；如果错误，输出正确的单个汉字。
-
-不要输出任何解释，只输出最终字符。"""
+请按照系统指令的格式输出：
+【分析】观察字形结构、笔画细节，并结合上下文 "{context_left}[?]{context_right}" 推断该字最可能是什么。
+【结果】输出最终确定的单个汉字。如果无法确定，输出 <UNKNOWN>。"""
         
         return prompt
     
     def _preprocess_image(
         self,
         crop_image: Image.Image,
+        target_size: int = 336,
     ) -> Image.Image:
-        """Preprocess image for Qwen2-VL.
+        """Preprocess image for Qwen2-VL with keep-ratio padding.
         
-        Ensures image is in correct format (RGB, 336x336).
+        Implements L2W1-DE-002: Keep-Ratio Resize + Center Padding.
+        This prevents character distortion by maintaining aspect ratio.
         
         Args:
-            crop_image: Input PIL Image (should be 336x336 from DataProcessor).
+            crop_image: Input PIL Image (can be any size).
+            target_size: Target canvas size (default: 336).
         
         Returns:
-            Preprocessed PIL Image in RGB format.
+            Preprocessed PIL Image in RGB format, size (target_size, target_size).
         """
         # Ensure RGB format
         if crop_image.mode != "RGB":
             crop_image = crop_image.convert("RGB")
         
-        # Resize to 336x336 if needed (should already be from DataProcessor)
-        if crop_image.size != (336, 336):
-            crop_image = crop_image.resize((336, 336), Image.Resampling.LANCZOS)
+        # If already target size, return as-is
+        if crop_image.size == (target_size, target_size):
+            return crop_image
         
-        return crop_image
+        # Get original dimensions
+        orig_w, orig_h = crop_image.size
+        
+        # Calculate scale factor to fit within target_size while keeping aspect ratio
+        # Scale based on the longer dimension
+        scale = target_size / max(orig_w, orig_h)
+        
+        # Calculate new dimensions (maintaining aspect ratio)
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        
+        # Resize image maintaining aspect ratio
+        resized_image = crop_image.resize(
+            (new_w, new_h),
+            Image.Resampling.LANCZOS,
+        )
+        
+        # Create black background canvas (336x336)
+        canvas = Image.new("RGB", (target_size, target_size), color=(0, 0, 0))
+        
+        # Calculate paste position (center the resized image)
+        paste_x = (target_size - new_w) // 2
+        paste_y = (target_size - new_h) // 2
+        
+        # Paste resized image onto canvas (centered)
+        canvas.paste(resized_image, (paste_x, paste_y))
+        
+        logger.debug(
+            f"Preprocessed image: {orig_w}x{orig_h} -> {new_w}x{new_h} "
+            f"(scale={scale:.3f}) -> {target_size}x{target_size} canvas "
+            f"(pasted at {paste_x}, {paste_y})"
+        )
+        
+        return canvas
     
     def _debug_log_messages(self, messages: List[Dict[str, Any]], label: str = "") -> None:
         """Debug log messages structure without printing huge image bytes.
@@ -505,12 +541,12 @@ OCR 认为这是：'{ocr_pred}'
     ) -> str:
         """Clean VLM output to extract single corrected character.
         
-        L2W1-MOD-005: Extract first Chinese character from output.
+        L2W1-MOD-005: Extract character from 【结果】tag or fallback to last Chinese char.
         Handles cases like:
-        - "KEEP" -> return ocr_pred
-        - "我认为是：莫" -> return "莫"
-        - "莫" -> return "莫"
-        - "莫，因为..." -> return "莫"
+        - "【分析】...【结果】莫" -> return "莫"
+        - "【结果】莫" -> return "莫"
+        - "【结果】<UNKNOWN>" -> return ocr_pred
+        - "莫" (no tags) -> return "莫" (fallback)
         
         Args:
             raw_output: Raw model output string.
@@ -525,19 +561,41 @@ OCR 认为这是：'{ocr_pred}'
         # Normalize whitespace
         raw_output = raw_output.strip()
         
-        # Check for "KEEP" (case-insensitive)
-        if raw_output.upper() == "KEEP" or "KEEP" in raw_output.upper():
-            return ocr_pred
+        # Strategy 1: Extract from 【结果】tag using regex
+        # Pattern: 【结果】followed by optional whitespace, then capture the first non-whitespace character
+        result_pattern = r"【结果】\s*(\S)"
+        result_match = re.search(result_pattern, raw_output)
         
-        # Extract first Chinese character using regex
-        # Pattern matches any single Chinese character (CJK Unified Ideographs)
+        if result_match:
+            result_char = result_match.group(1)
+            # Check if it's <UNKNOWN>
+            if result_char == "<" or "UNKNOWN" in raw_output.upper():
+                logger.debug(f"Model output <UNKNOWN>, using original prediction: '{ocr_pred}'")
+                return ocr_pred
+            # Check if it's a Chinese character
+            chinese_char_pattern = r'[\u4e00-\u9fff]'
+            if re.match(chinese_char_pattern, result_char):
+                logger.debug(f"Extracted character from 【结果】tag: '{result_char}'")
+                return result_char
+            else:
+                logger.warning(
+                    f"【结果】tag found but character '{result_char}' is not Chinese. "
+                    f"Falling back to last Chinese character search."
+                )
+        
+        # Strategy 2: Fallback - extract last Chinese character in output
+        # This handles cases where model doesn't follow the format exactly
         chinese_char_pattern = r'[\u4e00-\u9fff]'
         matches = re.findall(chinese_char_pattern, raw_output)
         
         if matches:
-            return matches[0]  # Return first Chinese character
+            last_char = matches[-1]  # Use last character (most likely the final answer)
+            logger.debug(
+                f"No 【结果】tag found, extracted last Chinese character: '{last_char}'"
+            )
+            return last_char
         
-        # Fallback: if no Chinese character found, return original prediction
+        # Strategy 3: Final fallback - return original prediction
         logger.warning(
             f"Failed to extract Chinese character from output: '{raw_output}'. "
             f"Using original OCR prediction: '{ocr_pred}'"
