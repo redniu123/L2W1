@@ -348,9 +348,22 @@ class AgentA:
             img_array = image
 
         # =====================================================================
-        # Step 2: Apply padding for square images (rec-only mode)
+        # Step 2: Smart Detection Mode Selection
         # =====================================================================
-        if skip_detection:
+        # [FIX] Intelligent detection mode: Force detection for non-square images
+        # This prevents recognition head from processing full images with background
+        h, w = img_array.shape[:2]
+        aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 1.0
+        
+        # Heuristic: If image is wide (width > 64) or aspect ratio > 1.5, force detection
+        # This ensures real-world long text images use detection mode
+        should_use_detection = w > 64 or aspect_ratio > 1.5
+        
+        # Override skip_detection if image suggests it needs detection
+        # Only skip detection if explicitly requested AND image is square/small
+        actual_skip_detection = skip_detection and not should_use_detection
+        
+        if actual_skip_detection:
             # Pad square images to make them look like text lines
             # This prevents distortion in the recognition model
             img_array = pad_square_image_for_ocr(
@@ -359,6 +372,11 @@ class AgentA:
                 fill_color=(255, 255, 255),  # White background
             )
             logger.debug("Running OCR in recognition-only mode (det=False)")
+        elif should_use_detection and skip_detection:
+            logger.info(
+                f"Auto-enabling detection mode for image {w}x{h} "
+                f"(aspect_ratio={aspect_ratio:.2f})"
+            )
 
         # =====================================================================
         # Step 3: Run PaddleOCR
@@ -366,8 +384,8 @@ class AgentA:
         try:
             raw_results = self.ocr_engine.ocr(
                 img_array,
-                cls=not skip_detection,
-                det=not skip_detection,
+                cls=not actual_skip_detection,
+                det=not actual_skip_detection,  # Use actual_skip_detection instead of skip_detection
                 rec=True,
             )
         except Exception as e:
