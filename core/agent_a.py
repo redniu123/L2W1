@@ -868,10 +868,10 @@ class AgentA:
             if boundaries is None or len(boundaries) != len(text) + 1:
                 # Fallback to linear split
                 logger.debug(f"Using linear split fallback for '{text}'")
-                char_width = (x_max - x_min) / len(text)
-                for i, char in enumerate(text):
-                    char_x1 = x_min + i * char_width
-                    char_x2 = char_x1 + char_width
+            char_width = (x_max - x_min) / len(text)
+            for i, char in enumerate(text):
+                char_x1 = x_min + i * char_width
+                char_x2 = char_x1 + char_width
                     char_results.append(
                         {
                             "char": char,
@@ -890,15 +890,15 @@ class AgentA:
                     char_x1 = x_min + boundaries[i]
                     char_x2 = x_min + boundaries[i + 1]
 
-                    char_results.append(
-                        {
-                            "char": char,
-                            "box": [char_x1, y_min, char_x2, y_max],
-                            "score": scores[i],
-                            "entropy": entropies[i],
-                            "line_text": text,
-                            "char_index": i,
-                        }
-                    )
+                char_results.append(
+                    {
+                        "char": char,
+                        "box": [char_x1, y_min, char_x2, y_max],
+                        "score": scores[i],
+                        "entropy": entropies[i],
+                        "line_text": text,
+                        "char_index": i,
+                    }
+                )
 
         return char_results

@@ -99,11 +99,13 @@ class AgentB:
             logger.info("✅ Tokenizer loaded")
             
             # [FIX] 2. 加载模型 (使用 AutoModel 以支持 MiniCPM)
-            # MiniCPM-V 推荐使用 bfloat16 和 sdpa attention
+            # [FIX] 解决 BFloat16/Byte 冲突：改用 float16（兼容性更好）
+            dtype = torch.float16  # 使用 float16 避免与 bitsandbytes 的 Byte 类型冲突
+            
             load_kwargs = {
                 "trust_remote_code": True,
                 "attn_implementation": "sdpa",  # Flash Attention 2 (faster)
-                "torch_dtype": torch.bfloat16,  # MiniCPM-V 推荐使用 bfloat16
+                "torch_dtype": dtype,
                 "device_map": "auto",
                 "local_files_only": local_files_only,
             }
@@ -113,10 +115,11 @@ class AgentB:
                     from transformers import BitsAndBytesConfig
                     quantization_config = BitsAndBytesConfig(
                         load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.bfloat16,  # 使用 bfloat16 匹配模型
+                        bnb_4bit_compute_dtype=dtype,  # 确保计算类型匹配（float16）
+                        bnb_4bit_quant_type="nf4",  # 使用 NF4 量化类型（标准配置）
                     )
                     load_kwargs["quantization_config"] = quantization_config
-                    logger.info("Using 4-bit quantization to save VRAM")
+                    logger.info("Using 4-bit quantization to save VRAM (float16 compute dtype)")
                 except ImportError:
                     logger.warning(
                         "bitsandbytes not available. Install with: pip install bitsandbytes"
