@@ -280,6 +280,7 @@ class Router:
         """Combined routing decision using both PPL and visual entropy.
         
         This is the main routing logic for L2W1:
+        - [FIX] Length sparsity check: Force route if text is too short (< 4 chars)
         - High PPL (semantic incoherence) OR
         - High visual entropy (OCR uncertainty)
         -> Route to Agent B
@@ -295,6 +296,24 @@ class Router:
             - should_route: True if should send to Agent B
             - metrics_dict: Contains ppl, visual_entropy, and decision factors
         """
+        # [FIX] Step 1: Length Sparsity Check (Sparsity Check)
+        # 如果一行长图（假设）识别出的字数少于 4 个，极大概率是漏读，强制送检
+        text_stripped = text.strip()
+        if len(text_stripped) < 4:
+            logger.info(
+                f"Router: Force routing due to short text length ({len(text_stripped)} chars): '{text_stripped}'"
+            )
+            # Return early with force routing flag
+            return True, {
+                "ppl": 0.0,  # Not computed (short circuit)
+                "visual_entropy": visual_entropy,
+                "high_ppl": False,
+                "high_entropy": False,
+                "should_route": True,
+                "force_routed_by_length": True,  # Flag to indicate length-based routing
+            }
+        
+        # Step 2: Compute PPL and check thresholds
         ppl = self.compute_ppl(text)
         
         # Decision logic: route if either metric exceeds threshold

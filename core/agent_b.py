@@ -18,22 +18,10 @@ from typing import Optional, Any, Dict, List
 
 import torch
 from PIL import Image
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from transformers import AutoModel, AutoTokenizer  # [FIX] 改用通用 AutoModel 以支持 MiniCPM
 
 # Initialize logger FIRST (before using it in import blocks)
 logger = logging.getLogger(__name__)
-
-# Qwen2-VL specific utilities for vision processing
-try:
-    from qwen_vl_utils import process_vision_info
-    QWEN_VL_UTILS_AVAILABLE = True
-except ImportError:
-    # Fallback if qwen_vl_utils is not available
-    process_vision_info = None
-    QWEN_VL_UTILS_AVAILABLE = False
-    logger.warning(
-        "qwen_vl_utils not found. Install with: pip install qwen-vl-utils"
-    )
 
 
 class AgentB:
@@ -45,12 +33,12 @@ class AgentB:
     - Outputs corrected single character
     
     Attributes:
-        model: Loaded VLM model (Qwen2VLForConditionalGeneration).
-        processor: Image and text processor for Qwen2-VL.
+        model: Loaded VLM model (MiniCPM-V-4_5).
+        tokenizer: Tokenizer for text encoding.
         device: Device where model runs.
     
     Example:
-        >>> agent_b = AgentB(model_path="Qwen/Qwen2-VL-2B-Instruct", load_in_4bit=True)
+        >>> agent_b = AgentB(model_path="openbmb/MiniCPM-V-4_5", load_in_4bit=True)
         >>> crop_image = Image.open("crop_336x336.jpg")
         >>> corrected = agent_b.inference(
         ...     crop_image=crop_image,
@@ -69,24 +57,24 @@ class AgentB:
     
     def __init__(
         self,
-        model_path: str = "Qwen/Qwen2-VL-2B-Instruct",
+        model_path: str = "openbmb/MiniCPM-V-4_5",  # [FIX] 切换模型
         load_in_4bit: bool = True,
     ) -> None:
         """Initialize Agent B with VLM model.
         
         Args:
             model_path: HuggingFace model identifier or local path.
-                - HuggingFace ID: "Qwen/Qwen2-VL-2B-Instruct"
-                - Local path: "/path/to/my_models/Qwen_Qwen2-VL-2B-Instruct"
-                Default: "Qwen/Qwen2-VL-2B-Instruct" (lightweight, fast).
+                - HuggingFace ID: "openbmb/MiniCPM-V-4_5" (SOTA model)
+                - Local path: "/path/to/my_models/MiniCPM-V-4_5"
+                Default: "openbmb/MiniCPM-V-4_5" (SOTA model per spec).
             load_in_4bit: Whether to use 4-bit quantization via bitsandbytes.
-                Saves VRAM significantly (recommended for 2B model).
+                Saves VRAM significantly.
         
         Raises:
             RuntimeError: If model loading fails.
             ImportError: If bitsandbytes not available when load_in_4bit=True.
         """
-        logger.info(f"Loading Agent B (VLM): {model_path}")
+        logger.info(f"Loading Agent B (SOTA): {model_path}")
         
         # 检测是否为本地路径
         from pathlib import Path
@@ -102,17 +90,20 @@ class AgentB:
             local_files_only = False
         
         try:
-            # Load processor (handles image and text preprocessing)
-            self.processor = AutoProcessor.from_pretrained(
+            # [FIX] 1. 加载 Tokenizer (MiniCPM 使用 AutoTokenizer)
+            self.tokenizer = AutoTokenizer.from_pretrained(
                 model_path,
                 trust_remote_code=True,
                 local_files_only=local_files_only,
             )
+            logger.info("✅ Tokenizer loaded")
             
-            # Load model with optional 4-bit quantization
+            # [FIX] 2. 加载模型 (使用 AutoModel 以支持 MiniCPM)
+            # MiniCPM-V 推荐使用 bfloat16 和 sdpa attention
             load_kwargs = {
                 "trust_remote_code": True,
-                "torch_dtype": "auto",
+                "attn_implementation": "sdpa",  # Flash Attention 2 (faster)
+                "torch_dtype": torch.bfloat16,  # MiniCPM-V 推荐使用 bfloat16
                 "device_map": "auto",
                 "local_files_only": local_files_only,
             }
@@ -122,7 +113,7 @@ class AgentB:
                     from transformers import BitsAndBytesConfig
                     quantization_config = BitsAndBytesConfig(
                         load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_compute_dtype=torch.bfloat16,  # 使用 bfloat16 匹配模型
                     )
                     load_kwargs["quantization_config"] = quantization_config
                     logger.info("Using 4-bit quantization to save VRAM")
@@ -132,7 +123,7 @@ class AgentB:
                     )
                     logger.warning("Falling back to full precision (may use more VRAM)")
             
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+            self.model = AutoModel.from_pretrained(
                 model_path,
                 **load_kwargs,
             )
@@ -147,7 +138,7 @@ class AgentB:
             else:
                 self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
-            logger.info(f"Agent B loaded successfully on {self.device}")
+            logger.info(f"Agent B (MiniCPM-V-4_5) loaded successfully on {self.device}")
             
         except Exception as e:
             logger.error(f"Failed to load Agent B: {e}")
@@ -189,7 +180,7 @@ OCR 认为这是：'{ocr_pred}'
         crop_image: Image.Image,
         target_size: int = 336,
     ) -> Image.Image:
-        """Preprocess image for Qwen2-VL with keep-ratio padding.
+        """Preprocess image for MiniCPM-V with keep-ratio padding.
         
         Implements L2W1-DE-002: Keep-Ratio Resize + Center Padding.
         This prevents character distortion by maintaining aspect ratio.
@@ -295,35 +286,30 @@ OCR 认为这是：'{ocr_pred}'
         context_right: str,
         ocr_pred: str,
     ) -> str:
-        """Run VLM inference to correct OCR prediction.
+        """Run VLM inference to correct OCR prediction using MiniCPM-V chat interface.
         
         L2W1-MOD-005: Uses V-CoT prompting to force explicit reasoning.
         
-        Enhanced with:
-        - Input validation to prevent None crashes
-        - Defensive programming around process_vision_info
-        - Debug logging for troubleshooting
-        - Guaranteed return value even on errors
+        [FIX] Uses MiniCPM-V native `.chat()` interface for stable inference.
         
         Args:
-            crop_image: Character crop image (336x336 PIL Image).
+            crop_image: Character crop image (PIL Image, will be preprocessed).
             context_left: Left context text.
             context_right: Right context text.
             ocr_pred: OCR predicted character to correct.
         
         Returns:
             Corrected character string (single character).
-            Returns ocr_pred if model outputs "KEEP" or fails.
-            Returns "ERROR" if critical failure occurs.
+            Returns ocr_pred if model outputs <UNKNOWN> or fails.
         """
         # ========================================================================
-        # Step 0: Input Validation (防止 None 崩溃)
+        # Step 0: Input Validation
         # ========================================================================
         logger.debug(f"[AgentB.inference] Starting inference for ocr_pred='{ocr_pred}'")
         
         if crop_image is None:
             logger.error("[AgentB.inference] crop_image is None! Cannot proceed.")
-            return ocr_pred  # Fallback to original prediction
+            return ocr_pred
         
         if not isinstance(crop_image, Image.Image):
             logger.error(f"[AgentB.inference] crop_image is not PIL.Image, got: {type(crop_image)}")
@@ -355,191 +341,39 @@ OCR 认为这是：'{ocr_pred}'
             logger.debug(f"[AgentB.inference] User prompt length: {len(user_prompt)}")
             
             # ====================================================================
-            # Step 3: Prepare Messages
+            # Step 3: Prepare Messages for MiniCPM-V chat interface
             # ====================================================================
-            messages = [
-                {
-                    "role": "system",
-                    "content": [
-                        {"type": "text", "text": self.SYSTEM_PROMPT},
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": processed_image},
-                        {"type": "text", "text": user_prompt},
-                    ],
-                },
-            ]
-            
-            self._debug_log_messages(messages, "Before process_vision_info")
+            # MiniCPM-V uses simple message format: [{'role': 'user', 'content': prompt}]
+            # The image is passed separately to .chat() method
+            msgs = [{'role': 'user', 'content': user_prompt}]
             
             # ====================================================================
-            # Step 4: Process Vision Info (关键步骤，防御性编程)
+            # Step 4: Call MiniCPM-V .chat() interface
             # ====================================================================
-            if not QWEN_VL_UTILS_AVAILABLE or process_vision_info is None:
-                logger.error(
-                    "[AgentB.inference] qwen_vl_utils.process_vision_info is NOT available! "
-                    "Install with: pip install qwen-vl-utils"
+            try:
+                logger.debug("[AgentB.inference] Calling MiniCPM-V .chat() interface...")
+                
+                # [FIX] 使用 MiniCPM 原生 chat 接口
+                res = self.model.chat(
+                    image=processed_image,  # 传入 PIL Image
+                    msgs=msgs,
+                    tokenizer=self.tokenizer,
+                    sampling=False,  # 贪婪解码保证稳定性
+                    max_new_tokens=128,
                 )
-                return ocr_pred
-            
-            # 调用 process_vision_info，放入 try-except 块
-            try:
-                logger.debug("[AgentB.inference] Calling process_vision_info...")
-                vision_result = process_vision_info(messages)
                 
-                # 检查返回值
-                if vision_result is None:
-                    logger.error("[AgentB.inference] process_vision_info returned None!")
-                    logger.warning("[AgentB.inference] Using original messages as fallback")
-                    # 不覆盖 messages，使用原始的
-                else:
-                    # 检查返回值类型
-                    if isinstance(vision_result, tuple):
-                        # 可能返回 (image_inputs, video_inputs)
-                        logger.debug(f"[AgentB.inference] process_vision_info returned tuple with {len(vision_result)} elements")
-                        if len(vision_result) >= 1:
-                            image_inputs = vision_result[0]
-                            video_inputs = vision_result[1] if len(vision_result) > 1 else None
-                            logger.debug(f"[AgentB.inference] image_inputs type: {type(image_inputs)}, video_inputs type: {type(video_inputs)}")
-                    elif isinstance(vision_result, list):
-                        # 返回处理后的 messages 列表
-                        logger.debug(f"[AgentB.inference] process_vision_info returned list with {len(vision_result)} messages")
-                        messages = vision_result
-                    else:
-                        logger.warning(f"[AgentB.inference] Unexpected return type: {type(vision_result)}")
-                        
-            except TypeError as e:
-                logger.error(f"[AgentB.inference] TypeError in process_vision_info: {e}")
-                logger.warning("[AgentB.inference] Continuing with original messages")
+                logger.debug(f"[AgentB.inference] MiniCPM-V chat returned: '{res}'")
+                
             except Exception as e:
-                logger.error(f"[AgentB.inference] Exception in process_vision_info: {e}")
-                logger.warning("[AgentB.inference] Continuing with original messages")
-            
-            self._debug_log_messages(messages, "After process_vision_info")
-            
-            # ====================================================================
-            # Step 5: Apply Chat Template
-            # ====================================================================
-            try:
-                text = self.processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                logger.debug(f"[AgentB.inference] Chat template applied, text length: {len(text)}")
-            except Exception as e:
-                logger.error(f"[AgentB.inference] Failed to apply chat template: {e}")
+                logger.error(f"[AgentB.inference] MiniCPM-V chat failed: {e}")
+                import traceback
+                logger.error(f"[AgentB.inference] Full traceback:\n{traceback.format_exc()}")
                 return ocr_pred
             
             # ====================================================================
-            # Step 6: Extract Images from Processed Messages
+            # Step 5: Clean Output
             # ====================================================================
-            images = []
-            if messages is not None:
-                for msg in messages:
-                    if msg is None:
-                        continue
-                    if msg.get("role") == "user":
-                        content = msg.get("content", [])
-                        if content is None:
-                            continue
-                        for item in content:
-                            if item is None:
-                                continue
-                            if item.get("type") == "image":
-                                img = item.get("image")
-                                if img is not None:
-                                    if isinstance(img, Image.Image):
-                                        images.append(img)
-                                    elif hasattr(img, "image"):
-                                        images.append(img.image)
-            
-            logger.debug(f"[AgentB.inference] Extracted {len(images)} images from messages")
-            
-            if not images:
-                logger.warning("[AgentB.inference] No images extracted! Using processed_image directly.")
-                images = [processed_image]
-            
-            # ====================================================================
-            # Step 7: Process with Processor
-            # ====================================================================
-            try:
-                inputs = self.processor(
-                    text=[text],
-                    images=images if images else None,
-                    padding=True,
-                    return_tensors="pt",
-                )
-                logger.debug(f"[AgentB.inference] Processor returned inputs with keys: {list(inputs.keys()) if hasattr(inputs, 'keys') else 'N/A'}")
-            except Exception as e:
-                logger.error(f"[AgentB.inference] Failed to process inputs: {e}")
-                return ocr_pred
-            
-            # Move inputs to model device
-            try:
-                if hasattr(inputs, "to"):
-                    inputs = inputs.to(self.device)
-                else:
-                    inputs = {k: v.to(self.device) if hasattr(v, "to") else v 
-                             for k, v in inputs.items()}
-            except Exception as e:
-                logger.error(f"[AgentB.inference] Failed to move inputs to device: {e}")
-                return ocr_pred
-            
-            # ====================================================================
-            # Step 8: Generate
-            # ====================================================================
-            try:
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=10,
-                    do_sample=False,
-                )
-                logger.debug(f"[AgentB.inference] Generation complete, output shape: {generated_ids.shape}")
-            except Exception as e:
-                logger.error(f"[AgentB.inference] Generation failed: {e}")
-                return ocr_pred
-            
-            # ====================================================================
-            # Step 9: Decode Output
-            # ====================================================================
-            try:
-                # Extract input_ids safely
-                if isinstance(inputs, dict):
-                    input_ids = inputs.get("input_ids")
-                elif hasattr(inputs, "input_ids"):
-                    input_ids = inputs.input_ids
-                else:
-                    logger.error("[AgentB.inference] Cannot find input_ids in inputs!")
-                    return ocr_pred
-                
-                if input_ids is None:
-                    logger.error("[AgentB.inference] input_ids is None!")
-                    return ocr_pred
-                
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids):] for in_ids, out_ids in zip(input_ids, generated_ids)
-                ]
-                
-                output_text = self.processor.batch_decode(
-                    generated_ids_trimmed,
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                )[0]
-                
-                logger.debug(f"[AgentB.inference] Decoded output: '{output_text}'")
-                
-            except Exception as e:
-                logger.error(f"[AgentB.inference] Failed to decode output: {e}")
-                return ocr_pred
-            
-            # ====================================================================
-            # Step 10: Clean Output
-            # ====================================================================
-            corrected_char = self._clean_output(output_text, ocr_pred)
+            corrected_char = self._clean_output(res, ocr_pred)
             logger.info(f"[AgentB.inference] Result: '{ocr_pred}' -> '{corrected_char}'")
             
             return corrected_char

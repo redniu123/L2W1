@@ -87,7 +87,7 @@ class L2W1Pipeline:
 
         Args:
             agent_b_model_path: Agent B 模型路径。
-                - 如果为 None，使用默认 "Qwen/Qwen2-VL-2B-Instruct"
+                - 如果为 None，使用默认 "openbmb/MiniCPM-V-4_5" (SOTA model)
                 - 如果是本地路径，会自动检测并使用离线模式
                 - 可以通过环境变量 HF_HOME 指定模型目录
         """
@@ -100,15 +100,20 @@ class L2W1Pipeline:
         if agent_b_model_path is None:
             # 尝试从环境变量或本地目录查找模型
             if MY_MODELS_DIR.exists():
-                # 查找 my_models 目录下的 Qwen2-VL 模型
-                potential_paths = list(MY_MODELS_DIR.glob("*Qwen*VL*"))
+                # 查找 my_models 目录下的 MiniCPM-V 模型（优先）或 Qwen2-VL 模型（兼容）
+                potential_paths = list(MY_MODELS_DIR.glob("*MiniCPM*V*"))
+                if not potential_paths:
+                    # Fallback: 查找 Qwen2-VL 模型（向后兼容）
+                    potential_paths = list(MY_MODELS_DIR.glob("*Qwen*VL*"))
                 if potential_paths:
                     agent_b_model_path = str(potential_paths[0])
                     logger.info(f"✅ 自动检测到本地模型: {agent_b_model_path}")
                 else:
-                    agent_b_model_path = "Qwen/Qwen2-VL-2B-Instruct"
+                    # [FIX] 使用 SOTA 模型 MiniCPM-V-4_5 作为默认值
+                    agent_b_model_path = "openbmb/MiniCPM-V-4_5"
             else:
-                agent_b_model_path = "Qwen/Qwen2-VL-2B-Instruct"
+                # [FIX] 使用 SOTA 模型 MiniCPM-V-4_5 作为默认值
+                agent_b_model_path = "openbmb/MiniCPM-V-4_5"
 
         self.agent_b = AgentB(model_path=agent_b_model_path, load_in_4bit=True)
 

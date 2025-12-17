@@ -348,35 +348,35 @@ class AgentA:
             img_array = image
 
         # =====================================================================
-        # Step 2: Smart Detection Mode Selection
+        # Step 2: Smart Detection Mode Selection (Line vs Single-Char)
         # =====================================================================
-        # [FIX] Intelligent detection mode: Force detection for non-square images
-        # This prevents recognition head from processing full images with background
+        # [FIX] 逻辑修正：只要看起来像文本行（长宽比大），就强制开启检测，无视 skip_detection 参数
+        # 之前的逻辑 actual_skip_detection = skip_detection and not should_use_detection 是错误的
         h, w = img_array.shape[:2]
-        aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 1.0
-        
-        # Heuristic: If image is wide (width > 64) or aspect ratio > 1.5, force detection
-        # This ensures real-world long text images use detection mode
-        should_use_detection = w > 64 or aspect_ratio > 1.5
-        
-        # Override skip_detection if image suggests it needs detection
-        # Only skip detection if explicitly requested AND image is square/small
-        actual_skip_detection = skip_detection and not should_use_detection
-        
-        if actual_skip_detection:
-            # Pad square images to make them look like text lines
-            # This prevents distortion in the recognition model
+        aspect_ratio = w / h if h > 0 else 0.0
+
+        # 定义：什么是"文本行"？
+        looks_like_text_line = w > 64 and aspect_ratio > 1.5
+
+        # 决策：
+        # 1. 如果看起来像文本行 -> 强制检测 (use_detection = True)
+        # 2. 否则 -> 听从参数 skip_detection 的安排
+        if looks_like_text_line:
+            use_detection = True
+            logger.info(
+                f"Auto-enabling detection for text line image ({w}x{h}, AR={aspect_ratio:.1f})"
+            )
+        else:
+            use_detection = not skip_detection
+
+        # 如果是纯识别模式（det=False），对接近方形的单字图做 padding，避免拉伸
+        if not use_detection and skip_detection:
             img_array = pad_square_image_for_ocr(
                 img_array,
                 padding_ratio=0.3,  # 30% padding on each side
                 fill_color=(255, 255, 255),  # White background
             )
             logger.debug("Running OCR in recognition-only mode (det=False)")
-        elif should_use_detection and skip_detection:
-            logger.info(
-                f"Auto-enabling detection mode for image {w}x{h} "
-                f"(aspect_ratio={aspect_ratio:.2f})"
-            )
 
         # =====================================================================
         # Step 3: Run PaddleOCR
@@ -384,8 +384,8 @@ class AgentA:
         try:
             raw_results = self.ocr_engine.ocr(
                 img_array,
-                cls=not actual_skip_detection,
-                det=not actual_skip_detection,  # Use actual_skip_detection instead of skip_detection
+                cls=use_detection,  # 文本行时同步开启方向分类
+                det=use_detection,  # 核心修正点：长文本行必须开启检测
                 rec=True,
             )
         except Exception as e:
@@ -406,12 +406,14 @@ class AgentA:
         # =====================================================================
         results: List[Dict[str, Any]] = []
 
-        # When det=False (skip_detection=True):
+        # When det=False (recognition-only mode):
         #   Return structure: [[(text, score), (text2, score2), ...]]
         # When det=True:
         #   Return structure: [[[box, (text, score)], [box2, (text2, score2)], ...]]
-
-        if skip_detection:
+        #
+        # IMPORTANT:
+        #   这里不能再直接依赖传入的 skip_detection，而是要根据最终决策的 use_detection
+        if not use_detection:
             # Recognition-only mode: result is [[(text, score), ...]]
             rec_results = raw_results[0]
 
