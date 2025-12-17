@@ -8,6 +8,19 @@ RESCUE PLAN:
 3. Use CER for evaluation.
 """
 
+import os
+
+# --- 【添加这两行】强制指定模型路径 & 离线模式 ---
+# 1. 指定你解压出来的 my_models 文件夹的绝对路径
+os.environ["HF_HOME"] = "/home/coder/project/L2W1/my_models"
+
+# 2. 告诉 Hugging Face 不要联网，直接用本地的
+os.environ["HF_HUB_OFFLINE"] = "1"
+# ------------------------------------------------
+
+
+# ... 原本的代码从这里继续 ...
+
 import argparse
 import json
 import logging
