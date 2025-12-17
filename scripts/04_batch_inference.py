@@ -9,43 +9,68 @@ RESCUE PLAN:
 """
 
 import os
-
-# --- 【添加这两行】强制指定模型路径 & 离线模式 ---
-# 1. 指定你解压出来的 my_models 文件夹的绝对路径
-os.environ["HF_HOME"] = "/home/coder/project/L2W1/my_models"
-
-# 2. 告诉 Hugging Face 不要联网，直接用本地的
-os.environ["HF_HUB_OFFLINE"] = "1"
-# ------------------------------------------------
-
-
-# ... 原本的代码从这里继续 ...
-
-import argparse
-import json
-import logging
 import sys
 from pathlib import Path
-from typing import List, Dict
 
-import cv2
-import numpy as np
-import Levenshtein
-from tqdm import tqdm
+# Add project root to path FIRST
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Configure Logging EARLY (before other imports that might use logger)
+import logging
 
-from core.agent_a import AgentA
-from core.agent_b import AgentB
-
-# Configure Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+# --- HuggingFace 模型路径和镜像配置 ---
+# 自动检测项目根目录下的 my_models 文件夹
+MY_MODELS_DIR = PROJECT_ROOT / "my_models"
+
+# 如果 my_models 目录存在，设置 HF_HOME
+if MY_MODELS_DIR.exists():
+    os.environ["HF_HOME"] = str(MY_MODELS_DIR)
+    logger.info(f"✅ 使用本地模型目录: {MY_MODELS_DIR}")
+else:
+    # 如果不存在，尝试使用默认的 HuggingFace cache 目录
+    # 不设置 HF_HOME，让 HuggingFace 使用默认位置
+    logger.info("⚠️  my_models 目录未找到，使用默认 HuggingFace 缓存目录")
+
+# 配置镜像站点（如果未设置）
+# 支持的镜像：hf-mirror.com（推荐）、openxlab、modelscope
+if "HF_ENDPOINT" not in os.environ:
+    # 默认使用 hf-mirror.com（国内访问友好）
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+    logger.info("✅ 已设置 HuggingFace 镜像: https://hf-mirror.com")
+    logger.info("💡 如需使用其他镜像，请设置环境变量: export HF_ENDPOINT=<镜像URL>")
+else:
+    logger.info(f"✅ 使用已配置的镜像: {os.environ['HF_ENDPOINT']}")
+
+# 离线模式：默认禁用，允许在线下载模型
+# 只有在明确设置环境变量时才启用离线模式
+HF_OFFLINE = os.environ.get("HF_HUB_OFFLINE", "")
+if HF_OFFLINE == "" or HF_OFFLINE == "0":
+    # 确保未设置离线模式，允许在线下载
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    logger.info("🌐 在线模式已启用（将从镜像站点下载模型）")
+else:
+    logger.info(f"📦 离线模式已启用: HF_HUB_OFFLINE={HF_OFFLINE}")
+
+# Now import other modules
+import argparse
+import json
+from typing import Dict
+
+import cv2
+import numpy as np
+import Levenshtein
+from tqdm import tqdm
+
+from core.agent_a import AgentA
+from core.agent_b import AgentB
 
 
 def normalize_text(text: str) -> str:
@@ -57,13 +82,35 @@ def normalize_text(text: str) -> str:
 
 
 class L2W1Pipeline:
-    def __init__(self):
+    def __init__(self, agent_b_model_path: str = None):
+        """Initialize L2W1 Pipeline.
+
+        Args:
+            agent_b_model_path: Agent B 模型路径。
+                - 如果为 None，使用默认 "Qwen/Qwen2-VL-2B-Instruct"
+                - 如果是本地路径，会自动检测并使用离线模式
+                - 可以通过环境变量 HF_HOME 指定模型目录
+        """
         logger.info("Initializing L2W1 Pipeline (Line-Level Mode)...")
         # 1. Agent A (The Scout) - Force Detection ON
         self.agent_a = AgentA(use_gpu=True)
 
         # 2. Agent B (The Judge)
-        self.agent_b = AgentB(model_path="Qwen/Qwen2-VL-2B-Instruct", load_in_4bit=True)
+        # 优先使用参数指定的路径，否则使用默认路径
+        if agent_b_model_path is None:
+            # 尝试从环境变量或本地目录查找模型
+            if MY_MODELS_DIR.exists():
+                # 查找 my_models 目录下的 Qwen2-VL 模型
+                potential_paths = list(MY_MODELS_DIR.glob("*Qwen*VL*"))
+                if potential_paths:
+                    agent_b_model_path = str(potential_paths[0])
+                    logger.info(f"✅ 自动检测到本地模型: {agent_b_model_path}")
+                else:
+                    agent_b_model_path = "Qwen/Qwen2-VL-2B-Instruct"
+            else:
+                agent_b_model_path = "Qwen/Qwen2-VL-2B-Instruct"
+
+        self.agent_b = AgentB(model_path=agent_b_model_path, load_in_4bit=True)
 
     def run(self, image_path: str, gt_text: str = "") -> Dict:
         """Process a single image."""
@@ -126,12 +173,8 @@ class L2W1Pipeline:
                 # We use a custom call to Agent B's internal model or modify the prompt slightly
                 # Here we reuse the interface but treat context as empty
                 try:
-                    # Construct a prompt that asks to read the text in the image
-                    # We hijack the inference method slightly
-                    prompt = f"图片中的手写文字OCR识别为：'{text_a}'，可能存在错误。请仔细观察图片，直接输出图片中正确的完整文字。"
-
-                    # Call Agent B logic manually to bypass the "single char" prompt restriction if needed
-                    # But let's try using the existing inference first
+                    # Call Agent B to correct the OCR prediction
+                    # Agent B will use its V-CoT prompt internally
                     corrected = self.agent_b.inference(
                         crop_image=line_crop_pil,
                         context_left="",  # No external context needed for line
@@ -179,9 +222,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_set", type=str, required=True)
     parser.add_argument("--output_csv", type=str, default="output/rescue_result.csv")
+    parser.add_argument(
+        "--agent_b_model",
+        type=str,
+        default=None,
+        help="Agent B 模型路径（本地路径或 HuggingFace ID）。如果未指定，将自动检测 my_models 目录",
+    )
     args = parser.parse_args()
 
-    pipeline = L2W1Pipeline()
+    pipeline = L2W1Pipeline(agent_b_model_path=args.agent_b_model)
 
     with open(args.test_set, "r") as f:
         data = json.load(f)

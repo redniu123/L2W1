@@ -75,7 +75,9 @@ class AgentB:
         """Initialize Agent B with VLM model.
         
         Args:
-            model_path: HuggingFace model identifier.
+            model_path: HuggingFace model identifier or local path.
+                - HuggingFace ID: "Qwen/Qwen2-VL-2B-Instruct"
+                - Local path: "/path/to/my_models/Qwen_Qwen2-VL-2B-Instruct"
                 Default: "Qwen/Qwen2-VL-2B-Instruct" (lightweight, fast).
             load_in_4bit: Whether to use 4-bit quantization via bitsandbytes.
                 Saves VRAM significantly (recommended for 2B model).
@@ -86,11 +88,25 @@ class AgentB:
         """
         logger.info(f"Loading Agent B (VLM): {model_path}")
         
+        # 检测是否为本地路径
+        from pathlib import Path
+        model_path_obj = Path(model_path)
+        is_local_path = model_path_obj.exists() and model_path_obj.is_dir()
+        
+        if is_local_path:
+            logger.info(f"✅ 检测到本地模型路径: {model_path}")
+            logger.info("📦 使用离线模式加载（local_files_only=True）")
+            local_files_only = True
+        else:
+            logger.info(f"🌐 使用在线模式加载（将从 HuggingFace 或镜像站点下载）")
+            local_files_only = False
+        
         try:
             # Load processor (handles image and text preprocessing)
             self.processor = AutoProcessor.from_pretrained(
                 model_path,
                 trust_remote_code=True,
+                local_files_only=local_files_only,
             )
             
             # Load model with optional 4-bit quantization
@@ -98,6 +114,7 @@ class AgentB:
                 "trust_remote_code": True,
                 "torch_dtype": "auto",
                 "device_map": "auto",
+                "local_files_only": local_files_only,
             }
             
             if load_in_4bit:
